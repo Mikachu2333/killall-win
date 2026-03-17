@@ -1,5 +1,5 @@
 @echo off
-set EXE=C:\Users\tipp_\OneDrive\Desktop\killallcplusplus\killall.exe
+set EXE=%~dp0killall.exe
 
 echo ============================================================
 echo TEST 1: Help
