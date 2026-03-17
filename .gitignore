@@ -1,0 +1,33 @@
+# Compiled objects and binaries
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.idb
+*.ipdb
+*.iobj
+
+# Build output logs
+build_out.txt
+build_err.txt
+
+# Visual Studio
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+
+# Release archives (generated, not tracked)
+*.zip
+*.7z
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# The compiled .exe IS tracked so users can download without building
+# If you want to exclude it, uncomment:
+# killall.exe
