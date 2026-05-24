@@ -20,6 +20,8 @@
 #include <tlhelp32.h>
 #include <wbemidl.h>
 
+#include "version.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -699,6 +701,11 @@ struct Args {
   int gpuThreshold = 0;
 };
 
+void printVersion() {
+  printf("killall v" KILLALL_VERSION_STR " — " KILLALL_DESCRIPTION "\n");
+  printf("Copyright: " KILLALL_COPYRIGHT "\n");
+}
+
 static void printHelp() {
   puts(BOLD("killall") " \xe2\x80\x94 Windows Process Termination Tool");
   puts("");
@@ -1161,6 +1168,17 @@ int wmain(int argc, wchar_t **wargv) {
   for (int i = 0; i < argc; i++) {
     argStorage.push_back(toNarrow(wargv[i]));
     argv.push_back(&argStorage.back()[0]);
+  }
+
+  // --version / -V exits immediately before any other processing
+  for (int i = 1; i < argc; i++) {
+    std::string arg = toNarrow(wargv[i]);
+    if (arg == "-V" || arg == "--version") {
+      printVersion();
+      if (g_hSingleInstanceMutex)
+        CloseHandle(g_hSingleInstanceMutex);
+      return 0;
+    }
   }
 
   Args a = parseArgs(argc, argv.data());
