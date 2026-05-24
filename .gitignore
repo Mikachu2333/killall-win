@@ -31,3 +31,4 @@ desktop.ini
 # The compiled .exe IS tracked so users can download without building
 # If you want to exclude it, uncomment:
 # killall.exe
+build/**
