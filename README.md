@@ -1,6 +1,6 @@
 # killall — Windows Process Termination Tool
 
-A fast, feature-rich `killall` command for Windows 11, written in C++.
+A fast, feature-rich `killall` command for Windows 7 through Windows 11, written in C++.
 Kill processes by name, pattern, port, DLL, window title, CPU/RAM usage, and more.
 
 ---
@@ -21,7 +21,7 @@ Kill processes by name, pattern, port, DLL, window title, CPU/RAM usage, and mor
 | Game killer | Kills Steam, Epic, Xbox, Ubisoft Connect, and running games |
 | Restart | Kill and relaunch a process |
 | Self-protection | Never kills itself |
-| Colour output | ANSI colour with dry-run safety net |
+| Safe output | Plain console output with a dry-run safety net (including Windows 7 and redirected logs) |
 
 ---
 
@@ -56,7 +56,7 @@ killall <subcommand> [options]
 -n, --dry-run         Show what would be killed without killing
 --cmdline <pat>       Match command-line substring or /regex/
 --module <dll>        Match processes with a specific DLL loaded
---port <N|A-B>        Match processes using a TCP/UDP port or range
+--port <N|A-B>        Match a local TCP/UDP port or range
 --window <title>      Match by visible window title (substring or /regex/)
 --parent <pid|name>   Match children of a specific parent process
 --top <N>             Limit ramhog/cpuhog to top N offenders
@@ -71,7 +71,7 @@ hung                  Kill hung/frozen applications
 networkapps           Kill all processes with network connections
 ramhog <MB>           Kill processes using more than N MB of RAM
 cpuhog <percent>      Kill processes using more than N% CPU (per core)
-gpu [--threshold N]   Kill processes using the GPU
+gpu                   Kill processes with known GPU API modules loaded
 llm                   Kill local AI/LLM processes
 game                  Kill games, launchers, and gaming services
 restart <name>        Kill a process then relaunch it
@@ -150,7 +150,7 @@ killall hung --force
 
 ### Requirements
 
-- Windows 10/11
+- Windows 7 through Windows 11
 - [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) with **Desktop development with C++** workload
   (or just the free **Build Tools for Visual Studio 2022**)
 
@@ -159,7 +159,8 @@ killall hung --force
 ```bat
 git clone https://github.com/YOUR_USERNAME/killall-windows
 cd killall-windows
-build.bat
+cmake -B build/x64 -A x64
+cmake --build build/x64 --config Release
 ```
 
 ### Install
@@ -181,13 +182,13 @@ install.bat
 | Process tree | `PROCESSENTRY32.th32ParentProcessID` traversal |
 | Command line | WMI `Win32_Process.CommandLine` |
 | Loaded modules | `CreateToolhelp32Snapshot (TH32CS_SNAPMODULE)` |
-| Network ports | `GetExtendedTcpTable` / `GetExtendedUdpTable` (IPv4 + IPv6 + UDP) |
+| Network ports | `GetExtendedTcpTable` / `GetExtendedUdpTable` (local TCP/UDP IPv4 and IPv6) |
 | Window title | `EnumWindows` + `GetWindowText` |
 | Hung detection | `SendMessageTimeout(WM_NULL, 2000ms)` |
 | Memory usage | `GetProcessMemoryInfo` |
 | CPU usage | Two-snapshot `GetProcessTimes` delta |
-| GPU detection | Checking for D3D/DXGI/Vulkan/CUDA DLL presence |
-| Process restart | `QueryFullProcessImageNameW` + `ShellExecuteA` |
+| GPU detection | Heuristic check for loaded D3D/DXGI/Vulkan/CUDA DLLs; this does not measure GPU memory or active utilization |
+| Process restart | `QueryFullProcessImageNameW` + `ShellExecuteW` |
 
 ---
 
@@ -196,7 +197,9 @@ install.bat
 - Processes running as **SYSTEM** (e.g. `gamingservices.exe`, `steamservice.exe`) require running killall as **Administrator** to terminate
 - `killall` never kills its own process (self-protection built in)
 - All pattern matching is case-insensitive
-- `cpuhog` reports per-core CPU percentage (same as Task Manager per-process view)
+- `cpuhog` reports total process CPU time divided by wall-clock time; a multithreaded process can exceed 100%
+- Port matching uses local ports only; remote service ports are intentionally ignored to prevent broad accidental matches
+- Critical Windows processes are refused even when killall is elevated
 
 ---
 

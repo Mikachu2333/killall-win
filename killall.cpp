@@ -3,6 +3,7 @@
  * Supports Windows 7 through Windows 11
  */
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #define _WIN32_WINNT 0x0601
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 
@@ -25,13 +26,18 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
+#include <memory>
 #include <regex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -43,43 +49,26 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 
-// ─── Single-instance mutex ──────────────────────────────────────────────────
-static HANDLE g_hSingleInstanceMutex = nullptr;
-
-static bool ensureSingleInstance() {
-  g_hSingleInstanceMutex =
-      CreateMutexW(nullptr, TRUE, L"killall-win-SingleInstance");
-  if (!g_hSingleInstanceMutex)
-    return true; // can't create mutex → allow to run
-  if (GetLastError() == ERROR_ALREADY_EXISTS) {
-    CloseHandle(g_hSingleInstanceMutex);
-    g_hSingleInstanceMutex = nullptr;
-    fprintf(stderr, "killall is already running. Only one instance allowed.\n");
-    return false;
+// ─── Win32 resource management ──────────────────────────────────────────────
+struct HandleCloser {
+  void operator()(void *handle) const noexcept {
+    if (handle && handle != INVALID_HANDLE_VALUE)
+      CloseHandle(static_cast<HANDLE>(handle));
   }
-  return true;
+};
+using UniqueHandle = std::unique_ptr<void, HandleCloser>;
+
+static UniqueHandle makeHandle(HANDLE handle) {
+  return UniqueHandle(handle == INVALID_HANDLE_VALUE ? nullptr : handle);
 }
 
-// ─── ANSI colours (best-effort VT mode) ─────────────────────────────────────
-static void enableColour() {
-  HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-  if (hOut != INVALID_HANDLE_VALUE && hOut != nullptr) {
-    DWORD mode = 0;
-    if (GetConsoleMode(hOut, &mode))
-      SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-  }
-  HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
-  if (hErr != INVALID_HANDLE_VALUE && hErr != nullptr) {
-    DWORD mode = 0;
-    if (GetConsoleMode(hErr, &mode))
-      SetConsoleMode(hErr, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-  }
-}
-#define RED(s) "\x1b[31m" s "\x1b[0m"
-#define GREEN(s) "\x1b[32m" s "\x1b[0m"
-#define YELLOW(s) "\x1b[33m" s "\x1b[0m"
-#define CYAN(s) "\x1b[36m" s "\x1b[0m"
-#define BOLD(s) "\x1b[1m" s "\x1b[0m"
+// ANSI escapes are deliberately disabled. Windows 7 and redirected output do
+// not reliably support VT sequences, and raw escapes make logs unreadable.
+#define RED(s) s
+#define GREEN(s) s
+#define YELLOW(s) s
+#define CYAN(s) s
+#define BOLD(s) s
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 static std::string toLower(std::string s) {
@@ -90,13 +79,31 @@ static std::string toLower(std::string s) {
 static std::string toNarrow(const std::wstring &w) {
   if (w.empty())
     return {};
-  int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr,
-                              nullptr);
+  const int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w.data(),
+                                    static_cast<int>(w.size()), nullptr, 0,
+                                    nullptr, nullptr);
   if (n <= 0)
     return {};
-  std::string s(n - 1, 0);
-  WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n, nullptr, nullptr);
+  std::string s(static_cast<size_t>(n), '\0');
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w.data(),
+                          static_cast<int>(w.size()), s.data(), n, nullptr,
+                          nullptr) != n)
+    return {};
   return s;
+}
+
+static std::wstring toWide(const std::string &s) {
+  if (s.empty())
+    return {};
+  const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(),
+                                    static_cast<int>(s.size()), nullptr, 0);
+  if (n <= 0)
+    return {};
+  std::wstring w(static_cast<size_t>(n), L'\0');
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(),
+                          static_cast<int>(s.size()), w.data(), n) != n)
+    return {};
+  return w;
 }
 
 // glob match: * = any sequence, ? = any char (case-insensitive)
@@ -133,7 +140,7 @@ static bool parseLong(const std::string &s, long &out) {
   return true;
 }
 static bool parseULongLong(const std::string &s, unsigned long long &out) {
-  if (s.empty())
+  if (s.empty() || s.front() == '-' || s.front() == '+')
     return false;
   char *end = nullptr;
   errno = 0;
@@ -148,7 +155,8 @@ static bool parseDouble(const std::string &s, double &out) {
   char *end = nullptr;
   errno = 0;
   out = strtod(s.c_str(), &end);
-  if (errno == ERANGE || end == s.c_str() || *end != '\0')
+  if (errno == ERANGE || end == s.c_str() || *end != '\0' ||
+      !std::isfinite(out))
     return false;
   return true;
 }
@@ -158,6 +166,7 @@ struct Pattern {
   enum Type { SUBSTRING, GLOB, REGEX } type;
   std::string raw;
   std::regex re;
+  bool valid = true;
 
   explicit Pattern(const std::string &pat) : type(SUBSTRING), raw(pat) {
     if (pat.size() >= 2 && pat.front() == '/' && pat.back() == '/') {
@@ -165,8 +174,8 @@ struct Pattern {
       std::string inner = pat.substr(1, pat.size() - 2);
       try {
         re = std::regex(inner, std::regex::icase | std::regex::ECMAScript);
-      } catch (...) {
-        type = SUBSTRING;
+      } catch (const std::regex_error &) {
+        valid = false;
       }
     } else if (pat.find('*') != std::string::npos ||
                pat.find('?') != std::string::npos) {
@@ -195,51 +204,73 @@ struct ProcInfo {
   std::string exePath;
   SIZE_T workingSetBytes = 0;
   double cpuPercent = 0.0;
+  ULONGLONG creationTime = 0;
 };
 
 // ─── Enumerate all processes ─────────────────────────────────────────────────
 static std::vector<ProcInfo> enumProcesses() {
   std::vector<ProcInfo> procs;
-  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if (snap == INVALID_HANDLE_VALUE)
+  auto snap = makeHandle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+  if (!snap)
     return procs;
   PROCESSENTRY32W pe;
   pe.dwSize = sizeof(pe);
-  if (Process32FirstW(snap, &pe)) {
+  if (Process32FirstW(static_cast<HANDLE>(snap.get()), &pe)) {
     do {
       ProcInfo p;
       p.pid = pe.th32ProcessID;
       p.ppid = pe.th32ParentProcessID;
       p.name = toLower(toNarrow(pe.szExeFile));
       procs.push_back(p);
-    } while (Process32NextW(snap, &pe));
+    } while (Process32NextW(static_cast<HANDLE>(snap.get()), &pe));
   }
-  CloseHandle(snap);
   return procs;
 }
 
 // get memory and exe path
 static void enrichBasic(ProcInfo &p) {
-  HANDLE h =
-      OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, p.pid);
-  if (!h)
-    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, p.pid);
-  if (!h)
-    return;
+  auto queryHandle =
+      makeHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, p.pid));
+  if (queryHandle) {
+    std::vector<wchar_t> path(32768);
+    DWORD size = static_cast<DWORD>(path.size());
+    if (QueryFullProcessImageNameW(static_cast<HANDLE>(queryHandle.get()), 0,
+                                   path.data(), &size))
+      p.exePath = toNarrow(std::wstring(path.data(), size));
 
-  wchar_t buf[MAX_PATH * 2] = {};
-  DWORD sz = (DWORD)(sizeof(buf) / sizeof(wchar_t));
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (GetProcessTimes(static_cast<HANDLE>(queryHandle.get()), &created,
+                        &exited, &kernel, &user)) {
+      ULARGE_INTEGER value{};
+      value.LowPart = created.dwLowDateTime;
+      value.HighPart = created.dwHighDateTime;
+      p.creationTime = value.QuadPart;
+    }
+  }
 
-  QueryFullProcessImageNameW(h, 0, buf, &sz);
-  p.exePath = toNarrow(buf);
-
-  PROCESS_MEMORY_COUNTERS pmc = {};
-  if (GetProcessMemoryInfo(h, &pmc, sizeof(pmc)))
-    p.workingSetBytes = pmc.WorkingSetSize;
-  CloseHandle(h);
+  auto memoryHandle = makeHandle(
+      OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, p.pid));
+  if (memoryHandle) {
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (GetProcessMemoryInfo(static_cast<HANDLE>(memoryHandle.get()), &pmc,
+                             sizeof(pmc)))
+      p.workingSetBytes = pmc.WorkingSetSize;
+  }
 }
 
 // ─── WMI command-line cache ──────────────────────────────────────────────────
+template <typename T> struct ComReleaser {
+  void operator()(T *value) const noexcept {
+    if (value)
+      value->Release();
+  }
+};
+template <typename T> using UniqueCom = std::unique_ptr<T, ComReleaser<T>>;
+struct BstrDeleter {
+  void operator()(wchar_t *value) const noexcept { SysFreeString(value); }
+};
+using UniqueBstr = std::unique_ptr<wchar_t, BstrDeleter>;
+
 static std::map<DWORD, std::string> g_cmdlineCache;
 static bool g_cmdlineCacheBuilt = false;
 
@@ -248,54 +279,75 @@ static void buildCmdlineCache() {
     return;
   g_cmdlineCacheBuilt = true;
 
-  IWbemLocator *pLoc = nullptr;
+  IWbemLocator *rawLocator = nullptr;
   if (FAILED(CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
-                              IID_IWbemLocator, (void **)&pLoc)) ||
-      !pLoc)
+                              IID_IWbemLocator,
+                              reinterpret_cast<void **>(&rawLocator))) ||
+      !rawLocator)
+    return;
+  UniqueCom<IWbemLocator> locator(rawLocator);
+
+  UniqueBstr nameSpace(SysAllocString(L"ROOT\\CIMV2"));
+  if (!nameSpace)
+    return;
+  IWbemServices *rawServices = nullptr;
+  HRESULT hr =
+      locator->ConnectServer(nameSpace.get(), nullptr, nullptr, nullptr, 0,
+                             nullptr, nullptr, &rawServices);
+  if (FAILED(hr) || !rawServices)
+    return;
+  UniqueCom<IWbemServices> services(rawServices);
+
+  hr = CoSetProxyBlanket(services.get(), RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE,
+                         nullptr, RPC_C_AUTHN_LEVEL_CALL,
+                         RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+  if (FAILED(hr))
     return;
 
-  IWbemServices *pSvc = nullptr;
-  BSTR ns = SysAllocString(L"ROOT\\CIMV2");
-  HRESULT hr = pLoc->ConnectServer(ns, nullptr, nullptr, nullptr, 0, nullptr,
-                                   nullptr, &pSvc);
-  SysFreeString(ns);
-  if (FAILED(hr) || !pSvc) {
-    pLoc->Release();
+  UniqueBstr wql(SysAllocString(L"WQL"));
+  UniqueBstr query(
+      SysAllocString(L"SELECT ProcessId, CommandLine FROM Win32_Process"));
+  if (!wql || !query)
     return;
-  }
+  IEnumWbemClassObject *rawEnumerator = nullptr;
+  hr =
+      services->ExecQuery(wql.get(), query.get(),
+                          WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                          nullptr, &rawEnumerator);
+  if (FAILED(hr) || !rawEnumerator)
+    return;
+  UniqueCom<IEnumWbemClassObject> enumerator(rawEnumerator);
 
-  CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
-                    RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
-                    nullptr, EOAC_NONE);
+  for (;;) {
+    IWbemClassObject *rawObject = nullptr;
+    ULONG returned = 0;
+    hr = enumerator->Next(5000, 1, &rawObject, &returned);
+    UniqueCom<IWbemClassObject> object(rawObject);
+    if (hr == WBEM_S_TIMEDOUT || returned == 0)
+      break;
+    if (FAILED(hr) || !object)
+      break;
 
-  IEnumWbemClassObject *pEnum = nullptr;
-  BSTR wql = SysAllocString(L"WQL");
-  BSTR query =
-      SysAllocString(L"SELECT ProcessId, CommandLine FROM Win32_Process");
-  hr = pSvc->ExecQuery(wql, query, WBEM_FLAG_FORWARD_ONLY, nullptr, &pEnum);
-  SysFreeString(wql);
-  SysFreeString(query);
-
-  if (SUCCEEDED(hr) && pEnum) {
-    IWbemClassObject *obj = nullptr;
-    ULONG ret = 0;
-    while (pEnum->Next(WBEM_INFINITE, 1, &obj, &ret) == WBEM_S_NO_ERROR) {
-      VARIANT vPid, vCmd;
-      VariantInit(&vPid);
-      VariantInit(&vCmd);
-      obj->Get(L"ProcessId", 0, &vPid, nullptr, nullptr);
-      obj->Get(L"CommandLine", 0, &vCmd, nullptr, nullptr);
-      DWORD pid = (DWORD)V_UI4(&vPid);
-      if (vCmd.vt == VT_BSTR && vCmd.bstrVal)
-        g_cmdlineCache[pid] = toNarrow(vCmd.bstrVal);
-      VariantClear(&vPid);
-      VariantClear(&vCmd);
-      obj->Release();
+    VARIANT pidValue{};
+    VARIANT commandValue{};
+    VariantInit(&pidValue);
+    VariantInit(&commandValue);
+    const HRESULT pidHr =
+        object->Get(L"ProcessId", 0, &pidValue, nullptr, nullptr);
+    const HRESULT commandHr =
+        object->Get(L"CommandLine", 0, &commandValue, nullptr, nullptr);
+    const bool validPid =
+        SUCCEEDED(pidHr) && (pidValue.vt == VT_I4 || pidValue.vt == VT_UI4);
+    if (validPid && SUCCEEDED(commandHr) && commandValue.vt == VT_BSTR &&
+        commandValue.bstrVal) {
+      const DWORD pid = pidValue.vt == VT_UI4
+                            ? pidValue.ulVal
+                            : static_cast<DWORD>(pidValue.lVal);
+      g_cmdlineCache[pid] = toNarrow(commandValue.bstrVal);
     }
-    pEnum->Release();
+    VariantClear(&pidValue);
+    VariantClear(&commandValue);
   }
-  pSvc->Release();
-  pLoc->Release();
 }
 
 static std::string getCmdline(DWORD pid) {
@@ -306,25 +358,24 @@ static std::string getCmdline(DWORD pid) {
 
 // ─── Loaded modules ──────────────────────────────────────────────────────────
 static bool processHasModule(DWORD pid, const std::string &modPat) {
-  HANDLE snap =
-      CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-  if (snap == INVALID_HANDLE_VALUE)
+  auto snap = makeHandle(
+      CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid));
+  if (!snap)
     return false;
-  MODULEENTRY32W me;
+  MODULEENTRY32W me{};
   me.dwSize = sizeof(me);
   bool found = false;
-  if (Module32FirstW(snap, &me)) {
+  if (Module32FirstW(static_cast<HANDLE>(snap.get()), &me)) {
     Pattern pat(modPat);
     do {
-      std::string mn = toLower(toNarrow(me.szModule));
-      std::string mp = toLower(toNarrow(me.szExePath));
-      if (pat.match(mn) || pat.match(mp)) {
+      const std::string name = toLower(toNarrow(me.szModule));
+      const std::string path = toLower(toNarrow(me.szExePath));
+      if (pat.match(name) || pat.match(path)) {
         found = true;
         break;
       }
-    } while (Module32NextW(snap, &me));
+    } while (Module32NextW(static_cast<HANDLE>(snap.get()), &me));
   }
-  CloseHandle(snap);
   return found;
 }
 
@@ -341,8 +392,7 @@ static bool processHasPort(DWORD pid, int portLo, int portHi) {
       for (DWORD i = 0; i < t->dwNumEntries; i++) {
         if (t->table[i].dwOwningPid == pid) {
           int lp = (int)ntohs((u_short)t->table[i].dwLocalPort);
-          int rp = (int)ntohs((u_short)t->table[i].dwRemotePort);
-          if ((lp >= portLo && lp <= portHi) || (rp >= portLo && rp <= portHi))
+          if (lp >= portLo && lp <= portHi)
             return true;
         }
       }
@@ -360,8 +410,7 @@ static bool processHasPort(DWORD pid, int portLo, int portHi) {
       for (DWORD i = 0; i < t->dwNumEntries; i++) {
         if (t->table[i].dwOwningPid == pid) {
           int lp = (int)ntohs((u_short)t->table[i].dwLocalPort);
-          int rp = (int)ntohs((u_short)t->table[i].dwRemotePort);
-          if ((lp >= portLo && lp <= portHi) || (rp >= portLo && rp <= portHi))
+          if (lp >= portLo && lp <= portHi)
             return true;
         }
       }
@@ -374,11 +423,32 @@ static bool processHasPort(DWORD pid, int portLo, int portHi) {
     std::vector<BYTE> buf(sz);
     if (GetExtendedUdpTable(buf.data(), &sz, FALSE, AF_INET,
                             UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
-      auto *t = reinterpret_cast<MIB_UDPTABLE_OWNER_PID *>(buf.data());
-      for (DWORD i = 0; i < t->dwNumEntries; i++) {
-        if (t->table[i].dwOwningPid == pid) {
-          int lp = (int)ntohs((u_short)t->table[i].dwLocalPort);
-          if (lp >= portLo && lp <= portHi)
+      const auto *table =
+          reinterpret_cast<const MIB_UDPTABLE_OWNER_PID *>(buf.data());
+      for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        if (table->table[i].dwOwningPid == pid) {
+          const int localPort = static_cast<int>(
+              ntohs(static_cast<u_short>(table->table[i].dwLocalPort)));
+          if (localPort >= portLo && localPort <= portHi)
+            return true;
+        }
+      }
+    }
+  }
+  // UDP IPv6
+  sz = 0;
+  GetExtendedUdpTable(nullptr, &sz, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+  if (sz > 0) {
+    std::vector<BYTE> buf(sz);
+    if (GetExtendedUdpTable(buf.data(), &sz, FALSE, AF_INET6,
+                            UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+      const auto *table =
+          reinterpret_cast<const MIB_UDP6TABLE_OWNER_PID *>(buf.data());
+      for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        if (table->table[i].dwOwningPid == pid) {
+          const int localPort = static_cast<int>(
+              ntohs(static_cast<u_short>(table->table[i].dwLocalPort)));
+          if (localPort >= portLo && localPort <= portHi)
             return true;
         }
       }
@@ -397,6 +467,8 @@ struct WinEnumCtx {
   bool found;
 };
 static BOOL CALLBACK enumWinProc(HWND hwnd, LPARAM lp) {
+  if (lp == 0)
+    return FALSE;
   auto *ctx = reinterpret_cast<WinEnumCtx *>(lp);
   DWORD wpid = 0;
   GetWindowThreadProcessId(hwnd, &wpid);
@@ -423,17 +495,19 @@ struct HungCtx {
   bool hung;
 };
 static BOOL CALLBACK enumHungProc(HWND hwnd, LPARAM lp) {
+  if (lp == 0)
+    return FALSE;
   auto *ctx = reinterpret_cast<HungCtx *>(lp);
   DWORD wpid = 0;
   GetWindowThreadProcessId(hwnd, &wpid);
   if (wpid == ctx->pid && IsWindow(hwnd)) {
-    if (SendMessageTimeout(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 2000,
-                           nullptr) == 0) {
-      // Returns 0 on timeout/hang; GetLastError() == 0 means no other error
-      if (GetLastError() == 0) {
-        ctx->hung = true;
-        return FALSE;
-      }
+    SetLastError(ERROR_SUCCESS);
+    DWORD_PTR result = 0;
+    if (SendMessageTimeout(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                           2000, &result) == 0 &&
+        GetLastError() == ERROR_TIMEOUT) {
+      ctx->hung = true;
+      return FALSE;
     }
   }
   return TRUE;
@@ -447,51 +521,60 @@ static bool isProcessHung(DWORD pid) {
 // ─── CPU usage (two-snapshot) ────────────────────────────────────────────────
 static std::map<DWORD, double>
 measureCpuUsage(int sampleSecs, const std::vector<ProcInfo> &allProcs) {
-  std::map<DWORD, ULONGLONG> t1;
-  for (auto &p : allProcs) {
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, p.pid);
-    if (!h)
-      h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, p.pid);
-    if (!h)
+  struct CpuSnapshot {
+    ULONGLONG creation = 0;
+    ULONGLONG cpu = 0;
+  };
+  std::map<DWORD, CpuSnapshot> first;
+  for (const auto &process : allProcs) {
+    auto handle = makeHandle(
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process.pid));
+    if (!handle)
       continue;
-    FILETIME ct, et, kt, ut;
-    if (GetProcessTimes(h, &ct, &et, &kt, &ut)) {
-      ULARGE_INTEGER k, u;
-      k.LowPart = kt.dwLowDateTime;
-      k.HighPart = kt.dwHighDateTime;
-      u.LowPart = ut.dwLowDateTime;
-      u.HighPart = ut.dwHighDateTime;
-      t1[p.pid] = k.QuadPart + u.QuadPart;
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (GetProcessTimes(static_cast<HANDLE>(handle.get()), &created, &exited,
+                        &kernel, &user)) {
+      ULARGE_INTEGER c{}, k{}, u{};
+      c.LowPart = created.dwLowDateTime;
+      c.HighPart = created.dwHighDateTime;
+      k.LowPart = kernel.dwLowDateTime;
+      k.HighPart = kernel.dwHighDateTime;
+      u.LowPart = user.dwLowDateTime;
+      u.HighPart = user.dwHighDateTime;
+      first[process.pid] = {c.QuadPart, k.QuadPart + u.QuadPart};
     }
-    CloseHandle(h);
   }
-  ULONGLONG wall1 = GetTickCount64();
+  const ULONGLONG wallStart = GetTickCount64();
   printf(YELLOW("  Sampling CPU for %d second(s)...\n"), sampleSecs);
-  Sleep((DWORD)(sampleSecs * 1000));
-  ULONGLONG wall2 = GetTickCount64();
-  ULONGLONG wallDiff = (wall2 - wall1) * 10000ULL; // ms -> 100ns
+  Sleep(static_cast<DWORD>(sampleSecs) * 1000U);
+  const ULONGLONG wallDiff =
+      (GetTickCount64() - wallStart) * 10000ULL; // ms -> 100ns
 
   std::map<DWORD, double> result;
-  for (auto &p : allProcs) {
-    if (t1.find(p.pid) == t1.end())
+  for (const auto &process : allProcs) {
+    const auto previous = first.find(process.pid);
+    if (previous == first.end())
       continue;
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, p.pid);
-    if (!h)
-      h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, p.pid);
-    if (!h)
+    auto handle = makeHandle(
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process.pid));
+    if (!handle)
       continue;
-    FILETIME ct, et, kt, ut;
-    if (GetProcessTimes(h, &ct, &et, &kt, &ut)) {
-      ULARGE_INTEGER k, u;
-      k.LowPart = kt.dwLowDateTime;
-      k.HighPart = kt.dwHighDateTime;
-      u.LowPart = ut.dwLowDateTime;
-      u.HighPart = ut.dwHighDateTime;
-      ULONGLONG diff = (k.QuadPart + u.QuadPart) - t1[p.pid];
-      if (wallDiff > 0)
-        result[p.pid] = (double)diff / (double)wallDiff * 100.0;
-    }
-    CloseHandle(h);
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(static_cast<HANDLE>(handle.get()), &created, &exited,
+                         &kernel, &user))
+      continue;
+    ULARGE_INTEGER c{}, k{}, u{};
+    c.LowPart = created.dwLowDateTime;
+    c.HighPart = created.dwHighDateTime;
+    k.LowPart = kernel.dwLowDateTime;
+    k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;
+    u.HighPart = user.dwHighDateTime;
+    const ULONGLONG cpu = k.QuadPart + u.QuadPart;
+    if (wallDiff > 0 && c.QuadPart == previous->second.creation &&
+        cpu >= previous->second.cpu)
+      result[process.pid] = static_cast<double>(cpu - previous->second.cpu) /
+                            static_cast<double>(wallDiff) * 100.0;
   }
   return result;
 }
@@ -503,24 +586,23 @@ static bool processUsesGPU(DWORD pid) {
       "nvoglv64.dll", "nvoglv32.dll", "ig4icd64.dll", "atig6pxx.dll",
       "vulkan-1.dll", "opengl32.dll", "nvcuda.dll",   "nvml.dll",
       "atioglxx.dll", "atigktxx.dll", nullptr};
-  HANDLE snap =
-      CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-  if (snap == INVALID_HANDLE_VALUE)
+  auto snap = makeHandle(
+      CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid));
+  if (!snap)
     return false;
-  MODULEENTRY32W me;
+  MODULEENTRY32W me{};
   me.dwSize = sizeof(me);
   bool found = false;
-  if (Module32FirstW(snap, &me)) {
+  if (Module32FirstW(static_cast<HANDLE>(snap.get()), &me)) {
     do {
-      std::string mn = toLower(toNarrow(me.szModule));
-      for (int i = 0; gpuMods[i]; i++)
-        if (mn == gpuMods[i]) {
+      const std::string name = toLower(toNarrow(me.szModule));
+      for (int i = 0; gpuMods[i]; ++i)
+        if (name == gpuMods[i]) {
           found = true;
           break;
         }
-    } while (!found && Module32NextW(snap, &me));
+    } while (!found && Module32NextW(static_cast<HANDLE>(snap.get()), &me));
   }
-  CloseHandle(snap);
   return found;
 }
 
@@ -617,24 +699,23 @@ static bool isGameProcess(const ProcInfo &p) {
   for (int i = 0; GAME_NAMES[i]; i++)
     if (n.find(GAME_NAMES[i]) != std::string::npos)
       return true;
-  HANDLE snap =
-      CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, p.pid);
-  if (snap == INVALID_HANDLE_VALUE)
+  auto snap = makeHandle(
+      CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, p.pid));
+  if (!snap)
     return false;
-  MODULEENTRY32W me;
+  MODULEENTRY32W me{};
   me.dwSize = sizeof(me);
   bool found = false;
-  if (Module32FirstW(snap, &me)) {
+  if (Module32FirstW(static_cast<HANDLE>(snap.get()), &me)) {
     do {
-      std::string mn = toLower(toNarrow(me.szModule));
-      for (int i = 0; GAME_MODS[i]; i++)
-        if (mn == GAME_MODS[i]) {
+      const std::string name = toLower(toNarrow(me.szModule));
+      for (int i = 0; GAME_MODS[i]; ++i)
+        if (name == GAME_MODS[i]) {
           found = true;
           break;
         }
-    } while (!found && Module32NextW(snap, &me));
+    } while (!found && Module32NextW(static_cast<HANDLE>(snap.get()), &me));
   }
-  CloseHandle(snap);
   return found;
 }
 
@@ -656,30 +737,99 @@ static std::set<DWORD> getProcessTree(DWORD rootPid,
 }
 
 // ─── Kill a PID ──────────────────────────────────────────────────────────────
-static bool killPid(DWORD pid) {
-  if (pid == 0 || pid == 4)
-    return false;
-  HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-  if (!h) {
-    fprintf(stderr, "  " RED("Access denied") " PID %lu\n", (unsigned long)pid);
+static bool isProtectedProcess(const ProcInfo &process, HANDLE handle) {
+  static const std::set<std::string> protectedNames = {
+      "csrss.exe", "lsass.exe",   "services.exe",
+      "smss.exe",  "wininit.exe", "winlogon.exe"};
+  if (process.pid == 0 || process.pid == 4 ||
+      protectedNames.count(toLower(process.name)) != 0)
+    return true;
+
+  using IsProcessCriticalFn = BOOL(WINAPI *)(HANDLE, PBOOL);
+  const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+  const auto isProcessCritical =
+      kernel ? reinterpret_cast<IsProcessCriticalFn>(
+                   GetProcAddress(kernel, "IsProcessCritical"))
+             : nullptr;
+  BOOL critical = FALSE;
+  return isProcessCritical && isProcessCritical(handle, &critical) && critical;
+}
+
+static bool killProcess(const ProcInfo &process) {
+  auto handle = makeHandle(OpenProcess(
+      PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+      FALSE, process.pid));
+  if (!handle) {
+    fprintf(stderr, "  Cannot open PID %lu (Windows error %lu)\n",
+            static_cast<unsigned long>(process.pid),
+            static_cast<unsigned long>(GetLastError()));
     return false;
   }
-  bool ok = TerminateProcess(h, 1) != 0;
-  CloseHandle(h);
-  return ok;
+
+  FILETIME created{}, exited{}, kernel{}, user{};
+  ULARGE_INTEGER creation{};
+  if (!GetProcessTimes(static_cast<HANDLE>(handle.get()), &created, &exited,
+                       &kernel, &user)) {
+    fprintf(stderr, "  Cannot verify PID %lu identity (Windows error %lu)\n",
+            static_cast<unsigned long>(process.pid),
+            static_cast<unsigned long>(GetLastError()));
+    return false;
+  }
+  creation.LowPart = created.dwLowDateTime;
+  creation.HighPart = created.dwHighDateTime;
+  if (process.creationTime == 0 || creation.QuadPart != process.creationTime) {
+    fprintf(stderr, "  Refusing PID %lu: process identity changed\n",
+            static_cast<unsigned long>(process.pid));
+    return false;
+  }
+  if (isProtectedProcess(process, static_cast<HANDLE>(handle.get()))) {
+    fprintf(stderr, "  Refusing to terminate protected process PID %lu\n",
+            static_cast<unsigned long>(process.pid));
+    return false;
+  }
+  if (!TerminateProcess(static_cast<HANDLE>(handle.get()), 1)) {
+    fprintf(stderr,
+            "  TerminateProcess failed for PID %lu (Windows error %lu)\n",
+            static_cast<unsigned long>(process.pid),
+            static_cast<unsigned long>(GetLastError()));
+    return false;
+  }
+  if (WaitForSingleObject(static_cast<HANDLE>(handle.get()), 5000) !=
+      WAIT_OBJECT_0) {
+    fprintf(stderr, "  Timed out waiting for PID %lu to terminate\n",
+            static_cast<unsigned long>(process.pid));
+    return false;
+  }
+  return true;
 }
 
 // ─── Resolve parent name/pid ─────────────────────────────────────────────────
 static DWORD resolveParentPid(const std::string &spec,
                               const std::vector<ProcInfo> &all) {
-  long n = 0;
-  if (parseLong(spec, n) && n > 0)
-    return (DWORD)n;
-  std::string lo = toLower(spec);
-  for (auto &p : all)
-    if (p.name.find(lo) != std::string::npos)
-      return p.pid;
-  return 0;
+  unsigned long long numeric = 0;
+  if (parseULongLong(spec, numeric)) {
+    if (numeric == 0 || numeric > std::numeric_limits<DWORD>::max())
+      return 0;
+    const DWORD pid = static_cast<DWORD>(numeric);
+    return std::any_of(
+               all.begin(), all.end(),
+               [pid](const ProcInfo &process) { return process.pid == pid; })
+               ? pid
+               : 0;
+  }
+  const std::string lower = toLower(spec);
+  DWORD result = 0;
+  for (const auto &process : all) {
+    std::string name = process.name;
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".exe") == 0)
+      name.resize(name.size() - 4);
+    if (name == lower) {
+      if (result != 0)
+        return 0; // Ambiguous names are unsafe.
+      result = process.pid;
+    }
+  }
+  return result;
 }
 
 // ─── Args struct ─────────────────────────────────────────────────────────────
@@ -687,6 +837,7 @@ struct Args {
   std::string pattern;
   std::string subcommand;
   std::string subArg;
+  std::string error;
   bool killTree = false;
   bool force = false;
   bool dryRun = false;
@@ -698,7 +849,6 @@ struct Args {
   std::string parentSpec;
   int top = 0;
   int sampleSecs = 2;
-  int gpuThreshold = 0;
 };
 
 void printVersion() {
@@ -730,7 +880,6 @@ static void printHelp() {
   puts("  -P, --parent <pid|name>  Match children of a parent process");
   puts("  -N, --top <N>            Limit ramhog/cpuhog to top N offenders");
   puts("  -s, --sample <N>         CPU sampling interval (seconds)");
-  puts("  -T, --threshold <N>      GPU memory threshold (MB, for gpu subcmd)");
   puts("  -h, --help               Show help");
   puts("");
   puts(BOLD("SUBCOMMANDS"));
@@ -767,9 +916,23 @@ static bool isSubcmd(const std::string &s) {
 static Args parseArgs(int argc, char **argv) {
   Args a;
   std::vector<std::string> pos;
-  for (int i = 1; i < argc; i++) {
-    std::string arg = argv[i];
-    if (arg == "-h" || arg == "--help")
+  auto requireValue = [&](int &index, const std::string &option,
+                          std::string &destination) {
+    if (index + 1 >= argc || argv[index + 1][0] == '\0') {
+      a.error = "option '" + option + "' requires a value";
+      return false;
+    }
+    destination = argv[++index];
+    return true;
+  };
+
+  for (int i = 1; i < argc && a.error.empty(); ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--") {
+      while (++i < argc)
+        pos.emplace_back(argv[i]);
+      break;
+    } else if (arg == "-h" || arg == "--help")
       a.help = true;
     else if (arg == "-t" || arg == "--tree")
       a.killTree = true;
@@ -777,42 +940,55 @@ static Args parseArgs(int argc, char **argv) {
       a.force = true;
     else if (arg == "-n" || arg == "--dry-run")
       a.dryRun = true;
-    else if ((arg == "-c" || arg == "--cmdline") && i + 1 < argc)
-      a.cmdlinePat = argv[++i];
-    else if ((arg == "-m" || arg == "--module") && i + 1 < argc)
-      a.modulePat = argv[++i];
-    else if ((arg == "-p" || arg == "--port") && i + 1 < argc)
-      a.portSpec = argv[++i];
-    else if ((arg == "-w" || arg == "--window") && i + 1 < argc)
-      a.windowPat = argv[++i];
-    else if ((arg == "-P" || arg == "--parent") && i + 1 < argc)
-      a.parentSpec = argv[++i];
-    else if ((arg == "-N" || arg == "--top") && i + 1 < argc) {
-      long v = 0;
-      if (parseLong(argv[i + 1], v) && v > 0)
-        a.top = (int)v;
-      i++;
-    } else if ((arg == "-s" || arg == "--sample") && i + 1 < argc) {
-      long v = 0;
-      if (parseLong(argv[i + 1], v) && v > 0)
-        a.sampleSecs = (int)v;
-      i++;
-    } else if ((arg == "-T" || arg == "--threshold") && i + 1 < argc) {
-      long v = 0;
-      if (parseLong(argv[i + 1], v) && v >= 0)
-        a.gpuThreshold = (int)v;
-      i++;
-    } else if (arg[0] != '-')
-      pos.push_back(arg);
-  }
-  if (!pos.empty()) {
-    if (isSubcmd(toLower(pos[0]))) {
-      a.subcommand = toLower(pos[0]);
-      if (pos.size() > 1)
-        a.subArg = pos[1];
+    else if (arg == "-c" || arg == "--cmdline")
+      requireValue(i, arg, a.cmdlinePat);
+    else if (arg == "-m" || arg == "--module")
+      requireValue(i, arg, a.modulePat);
+    else if (arg == "-p" || arg == "--port")
+      requireValue(i, arg, a.portSpec);
+    else if (arg == "-w" || arg == "--window")
+      requireValue(i, arg, a.windowPat);
+    else if (arg == "-P" || arg == "--parent")
+      requireValue(i, arg, a.parentSpec);
+    else if (arg == "-N" || arg == "--top" || arg == "-s" ||
+             arg == "--sample") {
+      std::string value;
+      if (!requireValue(i, arg, value))
+        continue;
+      long parsed = 0;
+      const long maximum = (arg == "-s" || arg == "--sample") ? 3600 : INT_MAX;
+      if (!parseLong(value, parsed) || parsed <= 0 || parsed > maximum) {
+        a.error = "invalid value '" + value + "' for option '" + arg + "'";
+        continue;
+      }
+      if (arg == "-s" || arg == "--sample")
+        a.sampleSecs = static_cast<int>(parsed);
+      else
+        a.top = static_cast<int>(parsed);
+    } else if (!arg.empty() && arg.front() == '-') {
+      a.error = "unknown option '" + arg + "'";
     } else {
-      a.pattern = pos[0];
+      pos.push_back(arg);
     }
+  }
+
+  if (!a.error.empty())
+    return a;
+  if (!pos.empty() && isSubcmd(toLower(pos.front()))) {
+    a.subcommand = toLower(pos.front());
+    if (pos.size() > 1)
+      a.subArg = pos[1];
+    if (pos.size() > 2)
+      a.error = "too many positional arguments";
+    const bool acceptsArgument = a.subcommand == "ramhog" ||
+                                 a.subcommand == "cpuhog" ||
+                                 a.subcommand == "restart";
+    if (!acceptsArgument && !a.subArg.empty())
+      a.error = "subcommand '" + a.subcommand + "' takes no argument";
+  } else if (!pos.empty()) {
+    a.pattern = pos.front();
+    if (pos.size() > 1)
+      a.error = "too many positional arguments";
   }
   return a;
 }
@@ -850,6 +1026,10 @@ static int doKill(std::vector<ProcInfo> targets, const Args &a,
     enrichBasic(p);
   if (skippedSelf)
     printf("  " YELLOW("Skipped") "  killall.exe (self)\n");
+  if (finalList.empty()) {
+    printf(YELLOW("  No safe matching processes remain.\n"));
+    return 0;
+  }
 
   // Print list
   printf(BOLD("  Processes to %s:\n"), a.dryRun ? "show (dry-run)" : "kill");
@@ -864,40 +1044,47 @@ static int doKill(std::vector<ProcInfo> targets, const Args &a,
   if (!proceed) {
     printf(BOLD("  Kill %zu process(es)? [y/N] "), finalList.size());
     fflush(stdout);
-    int c = getchar();
-    if (c != EOF && c != '\n')
-      while (getchar() != '\n')
-        ; // consume rest of line
+    const int c = getchar();
+    if (c != EOF && c != '\n') {
+      int rest = 0;
+      do {
+        rest = getchar();
+      } while (rest != '\n' && rest != EOF);
+    }
     proceed = (c == 'y' || c == 'Y');
   }
   if (!proceed) {
     printf("  Aborted.\n");
-    return 0;
+    return 3;
   }
 
-  // Kill deepest first (children before parents), regardless of PID numbering
-  std::map<DWORD, int> depth;
-  for (auto &p : finalList)
-    depth[p.pid] = 0;
-  bool depthChanged = true;
-  while (depthChanged) {
-    depthChanged = false;
-    for (auto &p : finalList) {
-      auto it = depth.find(p.ppid);
-      if (it != depth.end() && it->second >= depth[p.pid]) {
-        depth[p.pid] = it->second + 1;
-        depthChanged = true;
-      }
+  // Compute bounded depths. A corrupt/racy parent snapshot may contain a
+  // cycle, so every traversal tracks visited PIDs rather than iterating until
+  // convergence.
+  std::map<DWORD, DWORD> parents;
+  for (const auto &p : finalList)
+    parents[p.pid] = p.ppid;
+  auto depthOf = [&parents](DWORD pid) {
+    std::set<DWORD> visited;
+    int depth = 0;
+    while (visited.insert(pid).second) {
+      const auto it = parents.find(pid);
+      if (it == parents.end() || it->second == pid)
+        break;
+      pid = it->second;
+      if (depth < static_cast<int>(parents.size()))
+        ++depth;
     }
-  }
+    return depth;
+  };
   std::sort(finalList.begin(), finalList.end(),
-            [&depth](const ProcInfo &a, const ProcInfo &b) {
-              return depth[a.pid] > depth[b.pid];
+            [&depthOf](const ProcInfo &left, const ProcInfo &right) {
+              return depthOf(left.pid) > depthOf(right.pid);
             });
 
   int killed = 0, failed = 0;
   for (auto &p : finalList) {
-    if (killPid(p.pid)) {
+    if (killProcess(p)) {
       printf("  " GREEN("Killed") "  %-32s PID %lu\n", p.name.c_str(),
              (unsigned long)p.pid);
       killed++;
@@ -908,36 +1095,57 @@ static int doKill(std::vector<ProcInfo> targets, const Args &a,
     }
   }
   printf(BOLD("  Done:") " %d killed, %d failed.\n", killed, failed);
-  return killed;
+  return failed == 0 ? 0 : 2;
 }
 
 // ─── Filter processes for pattern mode ───────────────────────────────────────
 static std::vector<ProcInfo> filterProcs(const std::vector<ProcInfo> &all,
-                                         const Args &a) {
+                                         const Args &a, bool &valid) {
+  valid = false;
   int portLo = 0, portHi = 0;
   bool filterPort = !a.portSpec.empty();
   if (filterPort) {
-    auto dash = a.portSpec.find('-');
-    if (dash != std::string::npos) {
-      long lo = 0, hi = 0;
-      if (parseLong(a.portSpec.substr(0, dash), lo) &&
-          parseLong(a.portSpec.substr(dash + 1), hi)) {
-        portLo = (int)lo;
-        portHi = (int)hi;
-      }
-    } else {
-      long v = 0;
-      if (parseLong(a.portSpec, v))
-        portLo = portHi = (int)v;
+    const auto dash = a.portSpec.find('-');
+    long lo = 0;
+    long hi = 0;
+    const bool portValid =
+        dash == std::string::npos
+            ? (parseLong(a.portSpec, lo) && (hi = lo, true))
+            : (dash != 0 && dash + 1 < a.portSpec.size() &&
+               a.portSpec.find('-', dash + 1) == std::string::npos &&
+               parseLong(a.portSpec.substr(0, dash), lo) &&
+               parseLong(a.portSpec.substr(dash + 1), hi));
+    if (!portValid || lo < 1 || hi > 65535 || lo > hi) {
+      fprintf(stderr, RED("  Error:") " invalid port or port range '%s'\n",
+              a.portSpec.c_str());
+      return {};
     }
+    portLo = static_cast<int>(lo);
+    portHi = static_cast<int>(hi);
   }
   DWORD parentPid = 0;
-  if (!a.parentSpec.empty())
+  if (!a.parentSpec.empty()) {
     parentPid = resolveParentPid(a.parentSpec, all);
+    if (parentPid == 0) {
+      fprintf(stderr,
+              RED("  Error:") " parent process was not found or is ambiguous: "
+                              "'%s'\n",
+              a.parentSpec.c_str());
+      return {};
+    }
+  }
 
   Pattern namePat(a.pattern);
   Pattern cmdlinePat(a.cmdlinePat);
+  Pattern modulePat(a.modulePat);
+  Pattern windowPat(a.windowPat);
+  if (!namePat.valid || !cmdlinePat.valid || !modulePat.valid ||
+      !windowPat.valid) {
+    fprintf(stderr, RED("  Error:") " invalid regular expression\n");
+    return {};
+  }
 
+  valid = true;
   std::vector<ProcInfo> results;
   for (auto &p : all) {
     if (p.pid == 0 || p.pid == 4)
@@ -1008,7 +1216,14 @@ static int cmdRamHog(const Args &a, const std::vector<ProcInfo> &all) {
             a.subArg.c_str());
     return 1;
   }
-  size_t limitBytes = (size_t)(limitMB * 1024ULL * 1024ULL);
+  constexpr unsigned long long bytesPerMB = 1024ULL * 1024ULL;
+  if (limitMB >
+      static_cast<unsigned long long>(std::numeric_limits<size_t>::max()) /
+          bytesPerMB) {
+    fprintf(stderr, RED("  Error:") " ramhog threshold is too large\n");
+    return 1;
+  }
+  const size_t limitBytes = static_cast<size_t>(limitMB * bytesPerMB);
   printf(BOLD("  Finding processes using > %s MB RAM...\n"), a.subArg.c_str());
   std::vector<ProcInfo> hogs;
   for (auto p : all) {
@@ -1059,15 +1274,6 @@ static int cmdCpuHog(const Args &a, const std::vector<ProcInfo> &all) {
   if (a.top > 0 && (int)hogs.size() > a.top)
     hogs.resize((size_t)a.top);
   printf("  Found %zu cpu-hog process(es).\n", hogs.size());
-
-  // Show CPU column before delegating kill logic to doKill
-  printf(BOLD("  Processes to %s:\n"), a.dryRun ? "show (dry-run)" : "kill");
-  for (auto &p : hogs)
-    printf("    " CYAN("%-32s") " PID %-6lu  CPU %.1f%%\n", p.name.c_str(),
-           (unsigned long)p.pid, p.cpuPercent);
-
-  if (a.dryRun)
-    return 0;
 
   return doKill(hogs, a, all);
 }
@@ -1131,43 +1337,52 @@ static int cmdRestart(const Args &a, const std::vector<ProcInfo> &all) {
     printf(YELLOW("  No matching process found.\n"));
     return 0;
   }
-  std::string exePath = targets[0].exePath;
+  if (targets.size() != 1) {
+    fprintf(
+        stderr,
+        RED("  Error:") " restart requires an unambiguous process name; found "
+                        "%zu matches\n",
+        targets.size());
+    return 1;
+  }
+  const std::string exePath = targets.front().exePath;
+  if (exePath.empty()) {
+    fprintf(stderr, RED("  Error:") " cannot determine executable path\n");
+    return 1;
+  }
   printf(BOLD("  Will restart: ") "%s\n", exePath.c_str());
 
-  Args ka = a;
-  ka.force = true;
-  doKill(targets, ka, all);
-  Sleep(1200);
+  const int killResult = doKill(targets, a, all);
+  if (killResult != 0 || a.dryRun)
+    return killResult;
 
-  if (!exePath.empty()) {
-    int wn = MultiByteToWideChar(CP_UTF8, 0, exePath.c_str(), -1, nullptr, 0);
-    std::wstring wexePath(wn > 0 ? wn - 1 : 0, 0);
-    if (wn > 0)
-      MultiByteToWideChar(CP_UTF8, 0, exePath.c_str(), -1, &wexePath[0], wn);
-    HINSTANCE r = ShellExecuteW(nullptr, L"open", wexePath.c_str(), nullptr,
-                                nullptr, SW_SHOWNORMAL);
-    if ((intptr_t)r > 32)
-      printf(GREEN("  Restarted") " %s\n", exePath.c_str());
-    else
-      fprintf(stderr, RED("  Failed to restart") " %s\n", exePath.c_str());
+  const std::wstring widePath = toWide(exePath);
+  if (widePath.empty()) {
+    fprintf(stderr, RED("  Error:") " executable path is not valid UTF-8\n");
+    return 1;
   }
+  HINSTANCE result = ShellExecuteW(nullptr, L"open", widePath.c_str(), nullptr,
+                                   nullptr, SW_SHOWNORMAL);
+  if (reinterpret_cast<INT_PTR>(result) <= 32) {
+    fprintf(stderr,
+            RED("  Failed to restart") " %s (ShellExecute error %lld)\n",
+            exePath.c_str(),
+            static_cast<long long>(reinterpret_cast<INT_PTR>(result)));
+    return 2;
+  }
+  printf(GREEN("  Restarted") " %s\n", exePath.c_str());
   return 0;
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 int wmain(int argc, wchar_t **wargv) {
-  enableColour();
-
-  if (!ensureSingleInstance())
-    return 1;
-
   // Convert wchar_t argv to UTF-8 for internal processing
   std::vector<std::string> argStorage;
   std::vector<char *> argv;
   argStorage.reserve(argc);
   for (int i = 0; i < argc; i++) {
     argStorage.push_back(toNarrow(wargv[i]));
-    argv.push_back(&argStorage.back()[0]);
+    argv.push_back(argStorage.back().data());
   }
 
   // --version / -V exits immediately before any other processing
@@ -1175,23 +1390,22 @@ int wmain(int argc, wchar_t **wargv) {
     std::string arg = toNarrow(wargv[i]);
     if (arg == "-V" || arg == "--version") {
       printVersion();
-      if (g_hSingleInstanceMutex)
-        CloseHandle(g_hSingleInstanceMutex);
       return 0;
     }
   }
 
   Args a = parseArgs(argc, argv.data());
-
+  if (!a.error.empty()) {
+    fprintf(stderr, RED("  Error:") " %s. Use -h for help.\n", a.error.c_str());
+    return 1;
+  }
   if (a.help || argc == 1) {
     printHelp();
-    if (g_hSingleInstanceMutex)
-      CloseHandle(g_hSingleInstanceMutex);
     return 0;
   }
 
-  // COM for WMI (may fail silently on systems without WMI)
-  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  const bool comInitialized = SUCCEEDED(comResult);
 
   auto allProcs = enumProcesses();
   int ret = 0;
@@ -1222,13 +1436,13 @@ int wmain(int argc, wchar_t **wargv) {
                                       "for help.\n");
       ret = 1;
     } else {
-      auto targets = filterProcs(allProcs, a);
-      ret = doKill(targets, a, allProcs);
+      bool filtersValid = false;
+      auto targets = filterProcs(allProcs, a, filtersValid);
+      ret = filtersValid ? doKill(targets, a, allProcs) : 1;
     }
   }
 
-  CoUninitialize();
-  if (g_hSingleInstanceMutex)
-    CloseHandle(g_hSingleInstanceMutex);
+  if (comInitialized)
+    CoUninitialize();
   return ret;
 }
