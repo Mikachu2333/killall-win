@@ -22,6 +22,7 @@
 #include <wbemidl.h>
 
 #include "version.hpp"
+#include "pattern.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -37,6 +38,7 @@
 #include <regex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -62,6 +64,22 @@ static UniqueHandle makeHandle(HANDLE handle) {
   return UniqueHandle(handle == INVALID_HANDLE_VALUE ? nullptr : handle);
 }
 
+// Process names and messages are UTF-8; switch the console output code page
+// for the duration of the run and restore it on exit so redirected logs and
+// other programs sharing the console are not left in a modified state.
+struct ConsoleUtf8Guard {
+  UINT original = 0;
+  bool active = false;
+  ConsoleUtf8Guard() {
+    original = GetConsoleOutputCP();
+    active = SetConsoleOutputCP(CP_UTF8) != FALSE;
+  }
+  ~ConsoleUtf8Guard() {
+    if (active)
+      SetConsoleOutputCP(original);
+  }
+};
+
 // ANSI escapes are deliberately disabled. Windows 7 and redirected output do
 // not reliably support VT sequences, and raw escapes make logs unreadable.
 #define RED(s) s
@@ -71,13 +89,10 @@ static UniqueHandle makeHandle(HANDLE handle) {
 #define BOLD(s) s
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
-static std::string toLower(std::string s) {
-  std::transform(s.begin(), s.end(), s.begin(),
-                 [](unsigned char c) { return (char)::tolower(c); });
-  return s;
-}
 static std::string toNarrow(const std::wstring &w) {
   if (w.empty())
+    return {};
+  if (w.size() > static_cast<size_t>(INT_MAX))
     return {};
   const int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w.data(),
                                     static_cast<int>(w.size()), nullptr, 0,
@@ -95,6 +110,8 @@ static std::string toNarrow(const std::wstring &w) {
 static std::wstring toWide(const std::string &s) {
   if (s.empty())
     return {};
+  if (s.size() > static_cast<size_t>(INT_MAX))
+    return {};
   const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(),
                                     static_cast<int>(s.size()), nullptr, 0);
   if (n <= 0)
@@ -106,95 +123,8 @@ static std::wstring toWide(const std::string &s) {
   return w;
 }
 
-// glob match: * = any sequence, ? = any char (case-insensitive)
-static bool globMatch(const std::string &pat, const std::string &str) {
-  std::string p = toLower(pat), s = toLower(str);
-  size_t pi = 0, si = 0, star = std::string::npos, match = 0;
-  while (si < s.size()) {
-    if (pi < p.size() && (p[pi] == s[si] || p[pi] == '?')) {
-      pi++;
-      si++;
-    } else if (pi < p.size() && p[pi] == '*') {
-      star = pi++;
-      match = si;
-    } else if (star != std::string::npos) {
-      pi = star + 1;
-      si = ++match;
-    } else
-      return false;
-  }
-  while (pi < p.size() && p[pi] == '*')
-    pi++;
-  return pi == p.size();
-}
-
-// ─── Safe numeric parsing helpers ────────────────────────────────────────────
-static bool parseLong(const std::string &s, long &out) {
-  if (s.empty())
-    return false;
-  char *end = nullptr;
-  errno = 0;
-  out = strtol(s.c_str(), &end, 10);
-  if (errno == ERANGE || end == s.c_str() || *end != '\0')
-    return false;
-  return true;
-}
-static bool parseULongLong(const std::string &s, unsigned long long &out) {
-  if (s.empty() || s.front() == '-' || s.front() == '+')
-    return false;
-  char *end = nullptr;
-  errno = 0;
-  out = strtoull(s.c_str(), &end, 10);
-  if (errno == ERANGE || end == s.c_str() || *end != '\0')
-    return false;
-  return true;
-}
-static bool parseDouble(const std::string &s, double &out) {
-  if (s.empty())
-    return false;
-  char *end = nullptr;
-  errno = 0;
-  out = strtod(s.c_str(), &end);
-  if (errno == ERANGE || end == s.c_str() || *end != '\0' ||
-      !std::isfinite(out))
-    return false;
-  return true;
-}
-
-// ─── Pattern object ──────────────────────────────────────────────────────────
-struct Pattern {
-  enum Type { SUBSTRING, GLOB, REGEX } type;
-  std::string raw;
-  std::regex re;
-  bool valid = true;
-
-  explicit Pattern(const std::string &pat) : type(SUBSTRING), raw(pat) {
-    if (pat.size() >= 2 && pat.front() == '/' && pat.back() == '/') {
-      type = REGEX;
-      std::string inner = pat.substr(1, pat.size() - 2);
-      try {
-        re = std::regex(inner, std::regex::icase | std::regex::ECMAScript);
-      } catch (const std::regex_error &) {
-        valid = false;
-      }
-    } else if (pat.find('*') != std::string::npos ||
-               pat.find('?') != std::string::npos) {
-      type = GLOB;
-    }
-  }
-
-  bool match(const std::string &name) const {
-    switch (type) {
-    case SUBSTRING:
-      return toLower(name).find(toLower(raw)) != std::string::npos;
-    case GLOB:
-      return globMatch(raw, name);
-    case REGEX:
-      return std::regex_search(name, re);
-    }
-    return false;
-  }
-};
+// Matching/parsing logic (toLower, globMatch, parseLong/parseULongLong/
+// parseDouble, Pattern) lives in pattern.hpp so it can be unit-tested.
 
 // ─── Process info struct ─────────────────────────────────────────────────────
 struct ProcInfo {
@@ -211,8 +141,13 @@ struct ProcInfo {
 static std::vector<ProcInfo> enumProcesses() {
   std::vector<ProcInfo> procs;
   auto snap = makeHandle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-  if (!snap)
+  if (!snap) {
+    fprintf(stderr,
+            RED("  Warning:") " process snapshot failed (Windows error %lu); "
+                              "no processes will be matched\n",
+            static_cast<unsigned long>(GetLastError()));
     return procs;
+  }
   PROCESSENTRY32W pe;
   pe.dwSize = sizeof(pe);
   if (Process32FirstW(static_cast<HANDLE>(snap.get()), &pe)) {
@@ -273,49 +208,63 @@ using UniqueBstr = std::unique_ptr<wchar_t, BstrDeleter>;
 
 static std::map<DWORD, std::string> g_cmdlineCache;
 static bool g_cmdlineCacheBuilt = false;
+static bool g_cmdlineCacheFailed = false;
 
 static void buildCmdlineCache() {
-  if (g_cmdlineCacheBuilt)
+  if (g_cmdlineCacheBuilt || g_cmdlineCacheFailed)
     return;
-  g_cmdlineCacheBuilt = true;
+  // g_cmdlineCacheBuilt is only set on success so a transient WMI failure is
+  // retried on the next getCmdline() call instead of silently caching nothing.
 
   IWbemLocator *rawLocator = nullptr;
   if (FAILED(CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
                               IID_IWbemLocator,
                               reinterpret_cast<void **>(&rawLocator))) ||
-      !rawLocator)
+      !rawLocator) {
+    g_cmdlineCacheFailed = true;
     return;
+  }
   UniqueCom<IWbemLocator> locator(rawLocator);
 
   UniqueBstr nameSpace(SysAllocString(L"ROOT\\CIMV2"));
-  if (!nameSpace)
+  if (!nameSpace) {
+    g_cmdlineCacheFailed = true;
     return;
+  }
   IWbemServices *rawServices = nullptr;
   HRESULT hr =
       locator->ConnectServer(nameSpace.get(), nullptr, nullptr, nullptr, 0,
                              nullptr, nullptr, &rawServices);
-  if (FAILED(hr) || !rawServices)
+  if (FAILED(hr) || !rawServices) {
+    g_cmdlineCacheFailed = true;
     return;
+  }
   UniqueCom<IWbemServices> services(rawServices);
 
   hr = CoSetProxyBlanket(services.get(), RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE,
                          nullptr, RPC_C_AUTHN_LEVEL_CALL,
                          RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
-  if (FAILED(hr))
+  if (FAILED(hr)) {
+    g_cmdlineCacheFailed = true;
     return;
+  }
 
   UniqueBstr wql(SysAllocString(L"WQL"));
   UniqueBstr query(
       SysAllocString(L"SELECT ProcessId, CommandLine FROM Win32_Process"));
-  if (!wql || !query)
+  if (!wql || !query) {
+    g_cmdlineCacheFailed = true;
     return;
+  }
   IEnumWbemClassObject *rawEnumerator = nullptr;
   hr =
       services->ExecQuery(wql.get(), query.get(),
                           WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
                           nullptr, &rawEnumerator);
-  if (FAILED(hr) || !rawEnumerator)
+  if (FAILED(hr) || !rawEnumerator) {
+    g_cmdlineCacheFailed = true;
     return;
+  }
   UniqueCom<IEnumWbemClassObject> enumerator(rawEnumerator);
 
   for (;;) {
@@ -348,16 +297,28 @@ static void buildCmdlineCache() {
     VariantClear(&pidValue);
     VariantClear(&commandValue);
   }
+  g_cmdlineCacheBuilt = true;
 }
 
 static std::string getCmdline(DWORD pid) {
   buildCmdlineCache();
+  if (!g_cmdlineCacheBuilt && g_cmdlineCacheFailed) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      fprintf(stderr,
+              RED("  Warning:") " WMI command-line query failed; --cmdline "
+                                "matching will return no results\n");
+    }
+  }
   auto it = g_cmdlineCache.find(pid);
   return it != g_cmdlineCache.end() ? it->second : "";
 }
 
 // ─── Loaded modules ──────────────────────────────────────────────────────────
-static bool processHasModule(DWORD pid, const std::string &modPat) {
+// Iterates loaded modules of pid; returns true as soon as fn returns true.
+template <typename Fn>
+static bool forEachModule(DWORD pid, Fn &&fn) {
   auto snap = makeHandle(
       CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid));
   if (!snap)
@@ -366,11 +327,8 @@ static bool processHasModule(DWORD pid, const std::string &modPat) {
   me.dwSize = sizeof(me);
   bool found = false;
   if (Module32FirstW(static_cast<HANDLE>(snap.get()), &me)) {
-    Pattern pat(modPat);
     do {
-      const std::string name = toLower(toNarrow(me.szModule));
-      const std::string path = toLower(toNarrow(me.szExePath));
-      if (pat.match(name) || pat.match(path)) {
+      if (fn(me)) {
         found = true;
         break;
       }
@@ -379,82 +337,92 @@ static bool processHasModule(DWORD pid, const std::string &modPat) {
   return found;
 }
 
+static bool processHasModule(DWORD pid, const std::string &modPat) {
+  Pattern pat(modPat);
+  return forEachModule(pid, [&pat](const MODULEENTRY32W &me) {
+    const std::string name = toLower(toNarrow(me.szModule));
+    const std::string path = toLower(toNarrow(me.szExePath));
+    return pat.match(name) || pat.match(path);
+  });
+}
+
 // ─── Network / ports ─────────────────────────────────────────────────────────
-static bool processHasPort(DWORD pid, int portLo, int portHi) {
-  // TCP IPv4
-  DWORD sz = 0;
-  GetExtendedTcpTable(nullptr, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-  if (sz > 0) {
-    std::vector<BYTE> buf(sz);
-    if (GetExtendedTcpTable(buf.data(), &sz, FALSE, AF_INET,
-                            TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
-      auto *t = reinterpret_cast<MIB_TCPTABLE_OWNER_PID *>(buf.data());
-      for (DWORD i = 0; i < t->dwNumEntries; i++) {
-        if (t->table[i].dwOwningPid == pid) {
-          int lp = (int)ntohs((u_short)t->table[i].dwLocalPort);
-          if (lp >= portLo && lp <= portHi)
-            return true;
-        }
-      }
+// Local TCP/UDP tables (IPv4 + IPv6) are snapshotted once per run. Checking
+// each process against freshly queried tables would re-enumerate the whole
+// table set 4x per PID, which makes `networkapps` and `--port` scans slow.
+struct NetworkTables {
+  std::vector<BYTE> tcp4, tcp6, udp4, udp6;
+};
+static const NetworkTables &networkTables() {
+  static const NetworkTables tables = [] {
+    NetworkTables t;
+    // The first call with a null buffer returns ERROR_INSUFFICIENT_BUFFER and
+    // only fills sz; only the second call returns NO_ERROR on success.
+    DWORD sz = 0;
+    GetExtendedTcpTable(nullptr, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL,
+                        0);
+    if (sz > 0) {
+      t.tcp4.resize(sz);
+      if (GetExtendedTcpTable(t.tcp4.data(), &sz, FALSE, AF_INET,
+                              TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR)
+        t.tcp4.clear();
     }
-  }
-  // TCP IPv6
-  sz = 0;
-  GetExtendedTcpTable(nullptr, &sz, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL,
-                      0);
-  if (sz > 0) {
-    std::vector<BYTE> buf(sz);
-    if (GetExtendedTcpTable(buf.data(), &sz, FALSE, AF_INET6,
-                            TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
-      auto *t = reinterpret_cast<MIB_TCP6TABLE_OWNER_PID *>(buf.data());
-      for (DWORD i = 0; i < t->dwNumEntries; i++) {
-        if (t->table[i].dwOwningPid == pid) {
-          int lp = (int)ntohs((u_short)t->table[i].dwLocalPort);
-          if (lp >= portLo && lp <= portHi)
-            return true;
-        }
-      }
+    sz = 0;
+    GetExtendedTcpTable(nullptr, &sz, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL,
+                        0);
+    if (sz > 0) {
+      t.tcp6.resize(sz);
+      if (GetExtendedTcpTable(t.tcp6.data(), &sz, FALSE, AF_INET6,
+                              TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR)
+        t.tcp6.clear();
     }
-  }
-  // UDP IPv4
-  sz = 0;
-  GetExtendedUdpTable(nullptr, &sz, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
-  if (sz > 0) {
-    std::vector<BYTE> buf(sz);
-    if (GetExtendedUdpTable(buf.data(), &sz, FALSE, AF_INET,
-                            UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
-      const auto *table =
-          reinterpret_cast<const MIB_UDPTABLE_OWNER_PID *>(buf.data());
-      for (DWORD i = 0; i < table->dwNumEntries; ++i) {
-        if (table->table[i].dwOwningPid == pid) {
-          const int localPort = static_cast<int>(
-              ntohs(static_cast<u_short>(table->table[i].dwLocalPort)));
-          if (localPort >= portLo && localPort <= portHi)
-            return true;
-        }
-      }
+    sz = 0;
+    GetExtendedUdpTable(nullptr, &sz, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+    if (sz > 0) {
+      t.udp4.resize(sz);
+      if (GetExtendedUdpTable(t.udp4.data(), &sz, FALSE, AF_INET,
+                              UDP_TABLE_OWNER_PID, 0) != NO_ERROR)
+        t.udp4.clear();
     }
-  }
-  // UDP IPv6
-  sz = 0;
-  GetExtendedUdpTable(nullptr, &sz, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
-  if (sz > 0) {
-    std::vector<BYTE> buf(sz);
-    if (GetExtendedUdpTable(buf.data(), &sz, FALSE, AF_INET6,
-                            UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
-      const auto *table =
-          reinterpret_cast<const MIB_UDP6TABLE_OWNER_PID *>(buf.data());
-      for (DWORD i = 0; i < table->dwNumEntries; ++i) {
-        if (table->table[i].dwOwningPid == pid) {
-          const int localPort = static_cast<int>(
-              ntohs(static_cast<u_short>(table->table[i].dwLocalPort)));
-          if (localPort >= portLo && localPort <= portHi)
-            return true;
-        }
-      }
+    sz = 0;
+    GetExtendedUdpTable(nullptr, &sz, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+    if (sz > 0) {
+      t.udp6.resize(sz);
+      if (GetExtendedUdpTable(t.udp6.data(), &sz, FALSE, AF_INET6,
+                              UDP_TABLE_OWNER_PID, 0) != NO_ERROR)
+        t.udp6.clear();
+    }
+    return t;
+  }();
+  return tables;
+}
+
+// All four MIB_*TABLE_OWNER_PID structs share the layout dwNumEntries followed
+// by an inline row array; the row fields used here are identical in type.
+template <typename Table>
+static bool tableHasPort(const std::vector<BYTE> &buf, DWORD pid, int portLo,
+                         int portHi) {
+  if (buf.size() < sizeof(Table))
+    return false;
+  const auto *table = reinterpret_cast<const Table *>(buf.data());
+  for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+    const auto &row = table->table[i];
+    if (row.dwOwningPid == pid) {
+      const int lp =
+          static_cast<int>(ntohs(static_cast<u_short>(row.dwLocalPort)));
+      if (lp >= portLo && lp <= portHi)
+        return true;
     }
   }
   return false;
+}
+
+static bool processHasPort(DWORD pid, int portLo, int portHi) {
+  const NetworkTables &t = networkTables();
+  return tableHasPort<MIB_TCPTABLE_OWNER_PID>(t.tcp4, pid, portLo, portHi) ||
+         tableHasPort<MIB_TCP6TABLE_OWNER_PID>(t.tcp6, pid, portLo, portHi) ||
+         tableHasPort<MIB_UDPTABLE_OWNER_PID>(t.udp4, pid, portLo, portHi) ||
+         tableHasPort<MIB_UDP6TABLE_OWNER_PID>(t.udp6, pid, portLo, portHi);
 }
 static bool processHasAnyNetwork(DWORD pid) {
   return processHasPort(pid, 1, 65535);
@@ -473,12 +441,17 @@ static BOOL CALLBACK enumWinProc(HWND hwnd, LPARAM lp) {
   DWORD wpid = 0;
   GetWindowThreadProcessId(hwnd, &wpid);
   if (wpid == ctx->pid) {
+    // EnumWindows yields top-level windows only. For cross-process top-level
+    // windows GetWindowTextW reads the system's caption cache directly -- it
+    // does not post WM_GETTEXT -- so it cannot block on a hung window, unlike
+    // SendMessageTimeout(WM_GETTEXT) which would time out before matching.
     wchar_t title[512] = {};
-    GetWindowTextW(hwnd, title, 511);
-    Pattern p(ctx->pat);
-    if (p.match(toNarrow(title))) {
-      ctx->found = true;
-      return FALSE;
+    if (GetWindowTextW(hwnd, title, 511) > 0) {
+      Pattern p(ctx->pat);
+      if (p.match(toNarrow(title))) {
+        ctx->found = true;
+        return FALSE;
+      }
     }
   }
   return TRUE;
@@ -501,11 +474,15 @@ static BOOL CALLBACK enumHungProc(HWND hwnd, LPARAM lp) {
   DWORD wpid = 0;
   GetWindowThreadProcessId(hwnd, &wpid);
   if (wpid == ctx->pid && IsWindow(hwnd)) {
-    SetLastError(ERROR_SUCCESS);
     DWORD_PTR result = 0;
-    if (SendMessageTimeout(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                           2000, &result) == 0 &&
-        GetLastError() == ERROR_TIMEOUT) {
+    // A responsive window answers WM_NULL quickly with a non-zero return.
+    // A zero return means the window did not respond within the timeout.
+    // GetLastError is NOT a reliable hung indicator here: when
+    // SMTO_ABORTIFHUNG bails out early on a hung thread it returns 0 while
+    // leaving GetLastError at ERROR_SUCCESS on current Windows versions.
+    if (SendMessageTimeoutW(hwnd, WM_NULL, 0, 0,
+                            SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000, &result) ==
+        0) {
       ctx->hung = true;
       return FALSE;
     }
@@ -544,11 +521,17 @@ measureCpuUsage(int sampleSecs, const std::vector<ProcInfo> &allProcs) {
       first[process.pid] = {c.QuadPart, k.QuadPart + u.QuadPart};
     }
   }
-  const ULONGLONG wallStart = GetTickCount64();
+  ULONGLONG wallStart = 0;
+  if (!QueryUnbiasedInterruptTime(&wallStart))
+    wallStart = GetTickCount64() * 10000ULL; // fallback: ms -> 100ns
   printf(YELLOW("  Sampling CPU for %d second(s)...\n"), sampleSecs);
   Sleep(static_cast<DWORD>(sampleSecs) * 1000U);
-  const ULONGLONG wallDiff =
-      (GetTickCount64() - wallStart) * 10000ULL; // ms -> 100ns
+  ULONGLONG wallEnd = 0;
+  if (!QueryUnbiasedInterruptTime(&wallEnd))
+    wallEnd = GetTickCount64() * 10000ULL;
+  // QueryUnbiasedInterruptTime is in 100ns units like GetProcessTimes, and it
+  // keeps counting while the machine sleeps (GetTickCount64 does not).
+  const ULONGLONG wallDiff = wallEnd - wallStart;
 
   std::map<DWORD, double> result;
   for (const auto &process : allProcs) {
@@ -586,24 +569,13 @@ static bool processUsesGPU(DWORD pid) {
       "nvoglv64.dll", "nvoglv32.dll", "ig4icd64.dll", "atig6pxx.dll",
       "vulkan-1.dll", "opengl32.dll", "nvcuda.dll",   "nvml.dll",
       "atioglxx.dll", "atigktxx.dll", nullptr};
-  auto snap = makeHandle(
-      CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid));
-  if (!snap)
+  return forEachModule(pid, [](const MODULEENTRY32W &me) {
+    const std::string name = toLower(toNarrow(me.szModule));
+    for (int i = 0; gpuMods[i]; ++i)
+      if (name == gpuMods[i])
+        return true;
     return false;
-  MODULEENTRY32W me{};
-  me.dwSize = sizeof(me);
-  bool found = false;
-  if (Module32FirstW(static_cast<HANDLE>(snap.get()), &me)) {
-    do {
-      const std::string name = toLower(toNarrow(me.szModule));
-      for (int i = 0; gpuMods[i]; ++i)
-        if (name == gpuMods[i]) {
-          found = true;
-          break;
-        }
-    } while (!found && Module32NextW(static_cast<HANDLE>(snap.get()), &me));
-  }
-  return found;
+  });
 }
 
 // ─── LLM detection ───────────────────────────────────────────────────────────
@@ -699,24 +671,13 @@ static bool isGameProcess(const ProcInfo &p) {
   for (int i = 0; GAME_NAMES[i]; i++)
     if (n.find(GAME_NAMES[i]) != std::string::npos)
       return true;
-  auto snap = makeHandle(
-      CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, p.pid));
-  if (!snap)
+  return forEachModule(p.pid, [](const MODULEENTRY32W &me) {
+    const std::string name = toLower(toNarrow(me.szModule));
+    for (int i = 0; GAME_MODS[i]; ++i)
+      if (name == GAME_MODS[i])
+        return true;
     return false;
-  MODULEENTRY32W me{};
-  me.dwSize = sizeof(me);
-  bool found = false;
-  if (Module32FirstW(static_cast<HANDLE>(snap.get()), &me)) {
-    do {
-      const std::string name = toLower(toNarrow(me.szModule));
-      for (int i = 0; GAME_MODS[i]; ++i)
-        if (name == GAME_MODS[i]) {
-          found = true;
-          break;
-        }
-    } while (!found && Module32NextW(static_cast<HANDLE>(snap.get()), &me));
-  }
-  return found;
+  });
 }
 
 // ─── Process tree ────────────────────────────────────────────────────────────
@@ -738,11 +699,13 @@ static std::set<DWORD> getProcessTree(DWORD rootPid,
 
 // ─── Kill a PID ──────────────────────────────────────────────────────────────
 static bool isProtectedProcess(const ProcInfo &process, HANDLE handle) {
+  // process.name is already lower-cased by enumProcesses().
   static const std::set<std::string> protectedNames = {
-      "csrss.exe", "lsass.exe",   "services.exe",
-      "smss.exe",  "wininit.exe", "winlogon.exe"};
+      "csrss.exe",       "lsass.exe",      "services.exe",
+      "smss.exe",        "wininit.exe",    "winlogon.exe",
+      "registry",        "secure system",  "memory compression"};
   if (process.pid == 0 || process.pid == 4 ||
-      protectedNames.count(toLower(process.name)) != 0)
+      protectedNames.count(process.name) != 0)
     return true;
 
   using IsProcessCriticalFn = BOOL(WINAPI *)(HANDLE, PBOOL);
@@ -777,7 +740,14 @@ static bool killProcess(const ProcInfo &process) {
   }
   creation.LowPart = created.dwLowDateTime;
   creation.HighPart = created.dwHighDateTime;
-  if (process.creationTime == 0 || creation.QuadPart != process.creationTime) {
+  if (process.creationTime == 0) {
+    fprintf(stderr,
+            "  Cannot verify PID %lu creation time (insufficient "
+            "permissions?); refusing to kill\n",
+            static_cast<unsigned long>(process.pid));
+    return false;
+  }
+  if (creation.QuadPart != process.creationTime) {
     fprintf(stderr, "  Refusing PID %lu: process identity changed\n",
             static_cast<unsigned long>(process.pid));
     return false;
@@ -817,7 +787,11 @@ static DWORD resolveParentPid(const std::string &spec,
                ? pid
                : 0;
   }
-  const std::string lower = toLower(spec);
+  std::string lower = toLower(spec);
+  // Accept both "explorer" and "explorer.exe" for symmetry with the name
+  // matching used everywhere else.
+  if (lower.size() > 4 && lower.compare(lower.size() - 4, 4, ".exe") == 0)
+    lower.resize(lower.size() - 4);
   DWORD result = 0;
   for (const auto &process : all) {
     std::string name = process.name;
@@ -839,8 +813,9 @@ struct Args {
   std::string subArg;
   std::string error;
   bool killTree = false;
-  bool force = false;
-  bool dryRun = false;
+  bool yes = false;    // -y/--yes: execute the kill
+  bool force = false;  // -f/--force: alias of -y (backwards compatibility)
+  bool dryRun = false; // -n/--dry-run: explicit dry run (default anyway)
   bool help = false;
   std::string cmdlinePat;
   std::string modulePat;
@@ -862,6 +837,7 @@ static void printHelp() {
   puts(BOLD("USAGE"));
   puts("  killall <pattern> [options]");
   puts("  killall <subcommand> [options]");
+  puts("  (Default: dry-run; add -y to actually kill)");
   puts("");
   puts(BOLD("PATTERN MATCHING"));
   puts("  name        Exact/substring match (case-insensitive)");
@@ -871,8 +847,9 @@ static void printHelp() {
   puts("");
   puts(BOLD("OPTIONS"));
   puts("  -t, --tree               Kill process tree");
-  puts("  -f, --force              Skip confirmation");
-  puts("  -n, --dry-run            Show what would be killed");
+  puts("  -y, --yes                Execute the kill (default is dry-run)");
+  puts("  -f, --force              Alias of --yes (kept for compatibility)");
+  puts("  -n, --dry-run            Explicit dry run (default behavior)");
   puts("  -c, --cmdline <pat>      Match command-line substring or /regex/");
   puts("  -m, --module <dll>       Match loaded module/DLL");
   puts("  -p, --port <N|A-B>       Match TCP/UDP port or range");
@@ -936,6 +913,8 @@ static Args parseArgs(int argc, char **argv) {
       a.help = true;
     else if (arg == "-t" || arg == "--tree")
       a.killTree = true;
+    else if (arg == "-y" || arg == "--yes")
+      a.yes = true;
     else if (arg == "-f" || arg == "--force")
       a.force = true;
     else if (arg == "-n" || arg == "--dry-run")
@@ -1015,13 +994,16 @@ static int doKill(std::vector<ProcInfo> targets, const Args &a,
   DWORD selfPid = GetCurrentProcessId();
   bool skippedSelf = killSet.count(selfPid) > 0;
   killSet.erase(selfPid);
+  std::unordered_map<DWORD, const ProcInfo *> byPid;
+  byPid.reserve(allProcs.size());
+  for (const auto &p : allProcs)
+    byPid[p.pid] = &p;
   std::vector<ProcInfo> finalList;
-  for (auto pid : killSet)
-    for (auto &p : allProcs)
-      if (p.pid == pid) {
-        finalList.push_back(p);
-        break;
-      }
+  for (auto pid : killSet) {
+    const auto it = byPid.find(pid);
+    if (it != byPid.end())
+      finalList.push_back(*it->second);
+  }
   for (auto &p : finalList)
     enrichBasic(p);
   if (skippedSelf)
@@ -1031,31 +1013,17 @@ static int doKill(std::vector<ProcInfo> targets, const Args &a,
     return 0;
   }
 
-  // Print list
-  printf(BOLD("  Processes to %s:\n"), a.dryRun ? "show (dry-run)" : "kill");
+  // Default is a dry run; only -y/--yes (or its alias -f/--force) executes
+  // the kill, and then without an interactive prompt.
+  const bool willKill = (a.yes || a.force) && !a.dryRun;
+  printf(BOLD("  Processes to %s:\n"), willKill ? "kill" : "show (dry-run)");
   for (auto &p : finalList)
     printf("    " CYAN("%-32s") " PID %-6lu  RAM %.1f MB\n", p.name.c_str(),
            (unsigned long)p.pid, p.workingSetBytes / (1024.0 * 1024.0));
 
-  if (a.dryRun)
+  if (!willKill) {
+    printf("  " YELLOW("Dry run: nothing was killed. Use -y to execute.") "\n");
     return 0;
-
-  bool proceed = a.force;
-  if (!proceed) {
-    printf(BOLD("  Kill %zu process(es)? [y/N] "), finalList.size());
-    fflush(stdout);
-    const int c = getchar();
-    if (c != EOF && c != '\n') {
-      int rest = 0;
-      do {
-        rest = getchar();
-      } while (rest != '\n' && rest != EOF);
-    }
-    proceed = (c == 'y' || c == 'Y');
-  }
-  if (!proceed) {
-    printf("  Aborted.\n");
-    return 3;
   }
 
   // Compute bounded depths. A corrupt/racy parent snapshot may contain a
@@ -1253,9 +1221,8 @@ static int cmdCpuHog(const Args &a, const std::vector<ProcInfo> &all) {
             a.subArg.c_str());
     return 1;
   }
-  int secs = a.sampleSecs > 0 ? a.sampleSecs : 2;
   printf(BOLD("  Finding processes using > %.1f%% CPU...\n"), limit);
-  auto cpuMap = measureCpuUsage(secs, all);
+  auto cpuMap = measureCpuUsage(a.sampleSecs, all);
 
   std::vector<ProcInfo> hogs;
   for (auto p : all) {
@@ -1323,6 +1290,10 @@ static int cmdRestart(const Args &a, const std::vector<ProcInfo> &all) {
     return 1;
   }
   std::string nameArg = toLower(a.subArg);
+  // Accept both "explorer" and "explorer.exe" for symmetry with the name
+  // matching used everywhere else.
+  if (nameArg.size() > 4 && nameArg.substr(nameArg.size() - 4) == ".exe")
+    nameArg = nameArg.substr(0, nameArg.size() - 4);
   std::vector<ProcInfo> targets;
   for (auto p : all) {
     std::string n = p.name;
@@ -1353,7 +1324,9 @@ static int cmdRestart(const Args &a, const std::vector<ProcInfo> &all) {
   printf(BOLD("  Will restart: ") "%s\n", exePath.c_str());
 
   const int killResult = doKill(targets, a, all);
-  if (killResult != 0 || a.dryRun)
+  // Restart only makes sense when the kill actually ran; a dry run (the
+  // default without -y) must not relaunch the process.
+  if (killResult != 0 || !(a.yes || a.force) || a.dryRun)
     return killResult;
 
   const std::wstring widePath = toWide(exePath);
@@ -1376,6 +1349,10 @@ static int cmdRestart(const Args &a, const std::vector<ProcInfo> &all) {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 int wmain(int argc, wchar_t **wargv) {
+  // Process names and messages are UTF-8; the guard restores the console
+  // output code page on every exit path.
+  ConsoleUtf8Guard consoleUtf8;
+
   // Convert wchar_t argv to UTF-8 for internal processing
   std::vector<std::string> argStorage;
   std::vector<char *> argv;
@@ -1385,9 +1362,12 @@ int wmain(int argc, wchar_t **wargv) {
     argv.push_back(argStorage.back().data());
   }
 
-  // --version / -V exits immediately before any other processing
+  // --version / -V exits immediately before any other processing; a "--"
+  // separator means the remaining arguments are positional, not options.
   for (int i = 1; i < argc; i++) {
     std::string arg = toNarrow(wargv[i]);
+    if (arg == "--")
+      break;
     if (arg == "-V" || arg == "--version") {
       printVersion();
       return 0;

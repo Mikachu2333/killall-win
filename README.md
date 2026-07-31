@@ -21,6 +21,7 @@ Kill processes by name, pattern, port, DLL, window title, CPU/RAM usage, and mor
 | Game killer | Kills Steam, Epic, Xbox, Ubisoft Connect, and running games |
 | Restart | Kill and relaunch a process |
 | Self-protection | Never kills itself |
+| Safe by default | Dry-run unless `-y` is given |
 | Safe output | Plain console output with a dry-run safety net (including Windows 7 and redirected logs) |
 
 ---
@@ -40,6 +41,8 @@ killall <pattern> [options]
 killall <subcommand> [options]
 ```
 
+By default `killall` only **lists** matching processes (dry-run) and never kills anything. Add `-y` (or the legacy alias `-f`) to actually execute the kill.
+
 ### Pattern Matching
 
 | Syntax | Type | Example |
@@ -52,8 +55,9 @@ killall <subcommand> [options]
 
 ```
 -t, --tree            Kill process and all its children
--f, --force           Skip confirmation prompt
--n, --dry-run         Show what would be killed without killing
+-y, --yes             Execute the kill (default is dry-run)
+-f, --force           Alias of --yes (kept for compatibility)
+-n, --dry-run         Explicit dry-run (this is the default behavior)
 --cmdline <pat>       Match command-line substring or /regex/
 --module <dll>        Match processes with a specific DLL loaded
 --port <N|A-B>        Match a local TCP/UDP port or range
@@ -83,48 +87,48 @@ restart <name>        Kill a process then relaunch it
 
 ```bat
 :: Kill all Notepad windows
-killall notepad
+killall notepad -y
 
 :: Kill Chrome and every child process it spawned
-killall chrome --tree
+killall chrome --tree -y
 
-:: See what's on port 8080 before killing it
-killall --port 8080 --dry-run
-killall --port 8080 --force
+:: See what's on port 8080 (dry-run is the default)
+killall --port 8080
 
-:: Kill anything holding a port range
-killall --port 3000-3010 --force
+:: Kill anything holding a port or port range
+killall --port 8080 -y
+killall --port 3000-3010 -y
 
 :: Kill by command-line content (useful for Python scripts)
-killall --cmdline fooocus --force
-killall --cmdline /server\.py$/ --force
+killall --cmdline fooocus -y
+killall --cmdline /server\.py$/ -y
 
 :: Kill processes with a specific DLL loaded
-killall --module msedge.dll --dry-run
+killall --module msedge.dll
 
 :: Kill by window title
-killall --window "Untitled" --force
+killall --window "Untitled" -y
 
 :: Kill all children of a process
-killall --parent explorer --dry-run
+killall --parent explorer
 
 :: Kill the top 3 RAM hogs over 500 MB
-killall ramhog 500 --top 3 --dry-run
+killall ramhog 500 --top 3
 
 :: Kill CPU hogs over 80% (per core), sampling for 3 seconds
-killall cpuhog 80 --sample 3 --top 5
+killall cpuhog 80 --sample 3 --top 5 -y
 
 :: Kill all local LLMs (Ollama, LM Studio, KoboldCPP, Fooocus, etc.)
-killall llm --force
+killall llm -y
 
 :: Kill all games and launchers (Steam, Epic, Xbox, Ubisoft, etc.)
-killall game --force
+killall game -y
 
 :: Kill and restart a process
-killall restart explorer
+killall restart explorer -y
 
 :: Kill hung/frozen applications
-killall hung --force
+killall hung -y
 ```
 
 ---

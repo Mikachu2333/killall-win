@@ -4,8 +4,8 @@ Used to test `killall hung`.
 
 Usage:
     python hung_test.py
-    killall hung --dry-run     # should detect this process
-    killall hung --force       # kills it
+    killall hung               # dry-run (default): should detect this process
+    killall hung -y            # kills it
 """
 import tkinter as tk
 import time

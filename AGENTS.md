@@ -1,7 +1,3 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Build
 
 CMake project (C++20, MSVC). Open the folder in VSCode with the CMake Tools extension, or build manually:
@@ -38,7 +34,7 @@ Single-file project at [killall.cpp](killall.cpp). A `killall`-like Windows proc
 1. `enumProcesses()` — `CreateToolhelp32Snapshot` for PID/name/PPID
 2. `enrichBasic()` — `OpenProcess` + `QueryFullProcessImageNameW` + `GetProcessMemoryInfo` for exe path and working set
 3. `filterProcs()` — applies name, cmdline (WMI cache), module, port, window-title, and parent filters
-4. `doKill()` — prints list, confirms, sorts children-before-parents, calls `TerminateProcess`
+4. `doKill()` — prints list, sorts children-before-parents, calls `TerminateProcess`. Default is a dry run; `-y/--yes` (alias `-f`) executes the kill
 
 **Multi-instance prevention**: Named mutex (`killall-win-SingleInstance`) checked at startup in `ensureSingleInstance()`.
 
