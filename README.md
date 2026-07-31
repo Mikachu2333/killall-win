@@ -205,7 +205,7 @@ install.bat
 - `cpuhog` reports total process CPU time divided by wall-clock time; a multithreaded process can exceed 100%
 - Port matching uses local ports only; remote service ports are intentionally ignored to prevent broad accidental matches
 - Critical Windows processes are refused even when killall is elevated
-- When a kill target cannot be opened for termination (e.g. SYSTEM processes), killall asks once whether to relaunch itself with administrator rights (UAC). The prompt only appears on an interactive console, never for dry runs, and never when already elevated
+- When a kill target cannot be opened for termination (e.g. SYSTEM processes), killall asks once whether to relaunch itself with administrator rights (UAC). The prompt only appears on an interactive console, never for dry runs, and never after an elevation relaunch has already been attempted
 
 ---
 

@@ -23,7 +23,7 @@ root.title("HUNG TEST WINDOW - killall test")
 root.geometry("420x120")
 tk.Label(
     root,
-    text=f"Intentionally hung process (PID {os.getpid()})\nRun: killall hung --force",
+    text=f"Intentionally hung process (PID {os.getpid()})\nRun: killall hung -y",
     font=("Consolas", 11),
     pady=20
 ).pack()

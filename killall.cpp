@@ -22,6 +22,7 @@
 #include <wbemidl.h>
 
 #include "version.hpp"
+#include "command_line.hpp"
 #include "pattern.hpp"
 
 #include <algorithm>
@@ -700,6 +701,7 @@ static std::set<DWORD> getProcessTree(DWORD rootPid,
 // re-execute the same request.
 static int g_argc = 0;
 static wchar_t **g_wargv = nullptr;
+static bool g_relaunchedElevated = false;
 
 // Critical system processes that must never be terminated, even when
 // elevated. process.name is already lower-cased by enumProcesses().
@@ -712,21 +714,21 @@ static const std::set<std::string> &protectedNames() {
 }
 
 static bool isElevated() {
-  // The marker is set right before the "runas" relaunch so the elevated
-  // instance never prompts again even if token inspection is unreliable.
-  wchar_t marker[2] = {};
-  if (GetEnvironmentVariableW(L"KILLALL_ELEVATED", marker, 2) > 0 &&
-      marker[0] == L'1')
-    return true;
-  HANDLE token = nullptr;
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+  HANDLE rawToken = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken))
     return false;
+  auto token = makeHandle(rawToken);
   TOKEN_ELEVATION elevation{};
   DWORD size = 0;
-  const bool ok = GetTokenInformation(token, TokenElevation, &elevation,
-                                      sizeof(elevation), &size) != FALSE;
-  CloseHandle(token);
-  return ok && elevation.TokenIsElevated != 0;
+  return GetTokenInformation(static_cast<HANDLE>(token.get()), TokenElevation,
+                             &elevation, sizeof(elevation), &size) != FALSE &&
+         elevation.TokenIsElevated != 0;
+}
+
+static bool elevationWasAttempted() {
+  wchar_t marker[2] = {};
+  return GetEnvironmentVariableW(L"KILLALL_ELEVATED", marker, 2) == 1 &&
+         marker[0] == L'1';
 }
 
 // True when at least one target cannot even be opened for termination with
@@ -737,7 +739,9 @@ static bool needsElevation(const std::vector<ProcInfo> &procs) {
   for (const auto &p : procs) {
     if (protectedNames().count(p.name) != 0)
       continue;
-    auto handle = makeHandle(OpenProcess(PROCESS_TERMINATE, FALSE, p.pid));
+    auto handle = makeHandle(OpenProcess(
+        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+        FALSE, p.pid));
     if (!handle && GetLastError() == ERROR_ACCESS_DENIED)
       return true;
   }
@@ -765,38 +769,38 @@ static bool confirmElevation() {
   return c == 'y' || c == 'Y';
 }
 
-// Quote rules mirror CommandLineToArgvW: wrap in quotes when the argument
-// contains a space or a quote; embedded quotes become \" .
-static std::wstring quoteArg(const std::wstring &arg) {
-  if (arg.find(L' ') == std::wstring::npos &&
-      arg.find(L'"') == std::wstring::npos)
-    return arg;
-  std::wstring out = L"\"";
-  for (wchar_t c : arg) {
-    if (c == L'"')
-      out += L"\\\"";
-    else
-      out += c;
+static bool getExecutablePath(std::wstring &path) {
+  DWORD capacity = MAX_PATH;
+  for (;;) {
+    std::vector<wchar_t> buffer(capacity);
+    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), capacity);
+    if (length == 0)
+      return false;
+    if (length < capacity) {
+      path.assign(buffer.data(), length);
+      return true;
+    }
+    if (capacity >= 32768)
+      return false;
+    capacity = capacity > 16384 ? 32768 : capacity * 2;
   }
-  out += L'"';
-  return out;
 }
 
 // Relaunch this exe with the original command line via ShellExecuteW "runas"
 // (triggers the UAC prompt). Returns false when the user cancels or the
 // relaunch fails, in which case the caller continues with current privileges.
 static bool rerunElevated() {
-  wchar_t exePath[MAX_PATH] = {};
-  if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH))
+  std::wstring exePath;
+  if (!getExecutablePath(exePath))
     return false;
   std::wstring cmdline;
   for (int i = 1; i < g_argc; ++i) {
     if (i > 1)
       cmdline += L' ';
-    cmdline += quoteArg(g_wargv[i]);
+    cmdline += quoteWindowsArg(g_wargv[i]);
   }
-  HINSTANCE result = ShellExecuteW(nullptr, L"runas", exePath, cmdline.c_str(),
-                                   nullptr, SW_SHOWNORMAL);
+  HINSTANCE result = ShellExecuteW(nullptr, L"runas", exePath.c_str(),
+                                   cmdline.c_str(), nullptr, SW_SHOWNORMAL);
   return reinterpret_cast<INT_PTR>(result) > 32;
 }
 
@@ -1127,14 +1131,21 @@ static int doKill(std::vector<ProcInfo> targets, const Args &a,
 
   // Ask for elevation when current privileges are insufficient. This runs
   // only in execute mode; dry runs never need to elevate.
-  if (!isElevated() && needsElevation(finalList) && confirmElevation()) {
-    SetEnvironmentVariableW(L"KILLALL_ELEVATED", L"1");
-    if (rerunElevated()) {
+  if (!isElevated() && !elevationWasAttempted() && needsElevation(finalList) &&
+      confirmElevation()) {
+    if (!SetEnvironmentVariableW(L"KILLALL_ELEVATED", L"1")) {
+      fprintf(stderr,
+              "  Cannot set elevation marker (Windows error %lu); "
+              "continuing with current privileges\n",
+              static_cast<unsigned long>(GetLastError()));
+    } else if (rerunElevated()) {
+      g_relaunchedElevated = true;
       printf("  " YELLOW("Restarting with administrator privileges...") "\n");
       return 0;
+    } else {
+      printf("  " YELLOW("Elevation cancelled or failed; continuing with "
+                         "current privileges.") "\n");
     }
-    printf("  " YELLOW("Elevation cancelled; continuing with current "
-                       "privileges.") "\n");
   }
 
   // Compute bounded depths. A corrupt/racy parent snapshot may contain a
@@ -1435,6 +1446,10 @@ static int cmdRestart(const Args &a, const std::vector<ProcInfo> &all) {
   printf(BOLD("  Will restart: ") "%s\n", exePath.c_str());
 
   const int killResult = doKill(targets, a, all);
+  // An elevated child inherited this same restart request; the current
+  // process must not launch a second copy of the target.
+  if (g_relaunchedElevated)
+    return 0;
   // Restart only makes sense when the kill actually ran; a dry run (the
   // default without -y) must not relaunch the process.
   if (killResult != 0 || !(a.yes || a.force) || a.dryRun)

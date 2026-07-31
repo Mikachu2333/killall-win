@@ -105,9 +105,10 @@ static void testParseULongLong() {
   CHECK(!parseULongLong("-1", v));
   CHECK(!parseULongLong("+1", v));
   CHECK(!parseULongLong("abc", v));
-  CHECK(parseULongLong(std::to_string(std::numeric_limits<unsigned long long>::max()),
-                       v) &&
-        v == std::numeric_limits<unsigned long long>::max());
+  CHECK(
+      parseULongLong(
+          std::to_string(std::numeric_limits<unsigned long long>::max()), v) &&
+      v == std::numeric_limits<unsigned long long>::max());
   CHECK(!parseULongLong(
       std::to_string(std::numeric_limits<unsigned long long>::max()) + "0", v));
 }
