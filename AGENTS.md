@@ -34,7 +34,7 @@ Single-file project at [killall.cpp](killall.cpp). A `killall`-like Windows proc
 1. `enumProcesses()` — `CreateToolhelp32Snapshot` for PID/name/PPID
 2. `enrichBasic()` — `OpenProcess` + `QueryFullProcessImageNameW` + `GetProcessMemoryInfo` for exe path and working set
 3. `filterProcs()` — applies name, cmdline (WMI cache), module, port, window-title, and parent filters
-4. `doKill()` — prints list, sorts children-before-parents, calls `TerminateProcess`. Default is a dry run; `-y/--yes` (alias `-f`) executes the kill
+4. `doKill()` — prints list, sorts children-before-parents, calls `TerminateProcess`. Default is a dry run; `-y/--yes` (alias `-f`) executes the kill. When a target cannot be opened for termination it may ask once to relaunch elevated via `ShellExecuteW("runas")`; the `KILLALL_ELEVATED` env marker plus a `TOKEN_ELEVATION` check prevent recursive prompts
 
 **Multi-instance prevention**: Named mutex (`killall-win-SingleInstance`) checked at startup in `ensureSingleInstance()`.
 

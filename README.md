@@ -22,6 +22,7 @@ Kill processes by name, pattern, port, DLL, window title, CPU/RAM usage, and mor
 | Restart | Kill and relaunch a process |
 | Self-protection | Never kills itself |
 | Safe by default | Dry-run unless `-y` is given |
+| Auto-elevation | Prompts to retry with administrator rights when needed |
 | Safe output | Plain console output with a dry-run safety net (including Windows 7 and redirected logs) |
 
 ---
@@ -204,6 +205,7 @@ install.bat
 - `cpuhog` reports total process CPU time divided by wall-clock time; a multithreaded process can exceed 100%
 - Port matching uses local ports only; remote service ports are intentionally ignored to prevent broad accidental matches
 - Critical Windows processes are refused even when killall is elevated
+- When a kill target cannot be opened for termination (e.g. SYSTEM processes), killall asks once whether to relaunch itself with administrator rights (UAC). The prompt only appears on an interactive console, never for dry runs, and never when already elevated
 
 ---
 

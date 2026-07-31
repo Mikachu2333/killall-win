@@ -317,8 +317,7 @@ static std::string getCmdline(DWORD pid) {
 
 // ─── Loaded modules ──────────────────────────────────────────────────────────
 // Iterates loaded modules of pid; returns true as soon as fn returns true.
-template <typename Fn>
-static bool forEachModule(DWORD pid, Fn &&fn) {
+template <typename Fn> static bool forEachModule(DWORD pid, Fn &&fn) {
   auto snap = makeHandle(
       CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid));
   if (!snap)
@@ -480,9 +479,8 @@ static BOOL CALLBACK enumHungProc(HWND hwnd, LPARAM lp) {
     // GetLastError is NOT a reliable hung indicator here: when
     // SMTO_ABORTIFHUNG bails out early on a hung thread it returns 0 while
     // leaving GetLastError at ERROR_SUCCESS on current Windows versions.
-    if (SendMessageTimeoutW(hwnd, WM_NULL, 0, 0,
-                            SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000, &result) ==
-        0) {
+    if (SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                            2000, &result) == 0) {
       ctx->hung = true;
       return FALSE;
     }
@@ -697,15 +695,115 @@ static std::set<DWORD> getProcessTree(DWORD rootPid,
   return tree;
 }
 
+// ─── Elevation (UAC) ─────────────────────────────────────────────────────────
+// Original command line is kept so a relaunched elevated instance can
+// re-execute the same request.
+static int g_argc = 0;
+static wchar_t **g_wargv = nullptr;
+
+// Critical system processes that must never be terminated, even when
+// elevated. process.name is already lower-cased by enumProcesses().
+static const std::set<std::string> &protectedNames() {
+  static const std::set<std::string> names = {
+      "csrss.exe", "lsass.exe",     "services.exe",
+      "smss.exe",  "wininit.exe",   "winlogon.exe",
+      "registry",  "secure system", "memory compression"};
+  return names;
+}
+
+static bool isElevated() {
+  // The marker is set right before the "runas" relaunch so the elevated
+  // instance never prompts again even if token inspection is unreliable.
+  wchar_t marker[2] = {};
+  if (GetEnvironmentVariableW(L"KILLALL_ELEVATED", marker, 2) > 0 &&
+      marker[0] == L'1')
+    return true;
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+    return false;
+  TOKEN_ELEVATION elevation{};
+  DWORD size = 0;
+  const bool ok = GetTokenInformation(token, TokenElevation, &elevation,
+                                      sizeof(elevation), &size) != FALSE;
+  CloseHandle(token);
+  return ok && elevation.TokenIsElevated != 0;
+}
+
+// True when at least one target cannot even be opened for termination with
+// the current token (ERROR_ACCESS_DENIED). Already-exited PIDs
+// (ERROR_INVALID_PARAMETER) are not counted; protected processes are skipped
+// because elevation would not make them killable anyway.
+static bool needsElevation(const std::vector<ProcInfo> &procs) {
+  for (const auto &p : procs) {
+    if (protectedNames().count(p.name) != 0)
+      continue;
+    auto handle = makeHandle(OpenProcess(PROCESS_TERMINATE, FALSE, p.pid));
+    if (!handle && GetLastError() == ERROR_ACCESS_DENIED)
+      return true;
+  }
+  return false;
+}
+
+// Only prompt when stdin is an interactive console; scripted or redirected
+// input must never trigger a UAC dialog unexpectedly.
+static bool confirmElevation() {
+  HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+  DWORD mode = 0;
+  if (!GetConsoleMode(in, &mode))
+    return false;
+  printf(BOLD(
+      "  Some targets require administrator privileges. ") "Elevate and retry? "
+                                                           "[y/N] ");
+  fflush(stdout);
+  const int c = getchar();
+  if (c != EOF && c != '\n') {
+    int rest = 0;
+    do {
+      rest = getchar();
+    } while (rest != '\n' && rest != EOF);
+  }
+  return c == 'y' || c == 'Y';
+}
+
+// Quote rules mirror CommandLineToArgvW: wrap in quotes when the argument
+// contains a space or a quote; embedded quotes become \" .
+static std::wstring quoteArg(const std::wstring &arg) {
+  if (arg.find(L' ') == std::wstring::npos &&
+      arg.find(L'"') == std::wstring::npos)
+    return arg;
+  std::wstring out = L"\"";
+  for (wchar_t c : arg) {
+    if (c == L'"')
+      out += L"\\\"";
+    else
+      out += c;
+  }
+  out += L'"';
+  return out;
+}
+
+// Relaunch this exe with the original command line via ShellExecuteW "runas"
+// (triggers the UAC prompt). Returns false when the user cancels or the
+// relaunch fails, in which case the caller continues with current privileges.
+static bool rerunElevated() {
+  wchar_t exePath[MAX_PATH] = {};
+  if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH))
+    return false;
+  std::wstring cmdline;
+  for (int i = 1; i < g_argc; ++i) {
+    if (i > 1)
+      cmdline += L' ';
+    cmdline += quoteArg(g_wargv[i]);
+  }
+  HINSTANCE result = ShellExecuteW(nullptr, L"runas", exePath, cmdline.c_str(),
+                                   nullptr, SW_SHOWNORMAL);
+  return reinterpret_cast<INT_PTR>(result) > 32;
+}
+
 // ─── Kill a PID ──────────────────────────────────────────────────────────────
 static bool isProtectedProcess(const ProcInfo &process, HANDLE handle) {
-  // process.name is already lower-cased by enumProcesses().
-  static const std::set<std::string> protectedNames = {
-      "csrss.exe",       "lsass.exe",      "services.exe",
-      "smss.exe",        "wininit.exe",    "winlogon.exe",
-      "registry",        "secure system",  "memory compression"};
   if (process.pid == 0 || process.pid == 4 ||
-      protectedNames.count(process.name) != 0)
+      protectedNames().count(process.name) != 0)
     return true;
 
   using IsProcessCriticalFn = BOOL(WINAPI *)(HANDLE, PBOOL);
@@ -838,6 +936,7 @@ static void printHelp() {
   puts("  killall <pattern> [options]");
   puts("  killall <subcommand> [options]");
   puts("  (Default: dry-run; add -y to actually kill)");
+  puts("  (Prompts to elevate when targets need administrator rights)");
   puts("");
   puts(BOLD("PATTERN MATCHING"));
   puts("  name        Exact/substring match (case-insensitive)");
@@ -1024,6 +1123,18 @@ static int doKill(std::vector<ProcInfo> targets, const Args &a,
   if (!willKill) {
     printf("  " YELLOW("Dry run: nothing was killed. Use -y to execute.") "\n");
     return 0;
+  }
+
+  // Ask for elevation when current privileges are insufficient. This runs
+  // only in execute mode; dry runs never need to elevate.
+  if (!isElevated() && needsElevation(finalList) && confirmElevation()) {
+    SetEnvironmentVariableW(L"KILLALL_ELEVATED", L"1");
+    if (rerunElevated()) {
+      printf("  " YELLOW("Restarting with administrator privileges...") "\n");
+      return 0;
+    }
+    printf("  " YELLOW("Elevation cancelled; continuing with current "
+                       "privileges.") "\n");
   }
 
   // Compute bounded depths. A corrupt/racy parent snapshot may contain a
@@ -1352,6 +1463,10 @@ int wmain(int argc, wchar_t **wargv) {
   // Process names and messages are UTF-8; the guard restores the console
   // output code page on every exit path.
   ConsoleUtf8Guard consoleUtf8;
+
+  // Remember the original command line for a possible elevation relaunch.
+  g_argc = argc;
+  g_wargv = wargv;
 
   // Convert wchar_t argv to UTF-8 for internal processing
   std::vector<std::string> argStorage;
