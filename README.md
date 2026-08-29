@@ -39,6 +39,7 @@ Or build from source — see [Building](#building).
 
 ```
 killall <pattern> [options]
+killall <pid> [<pid> ...] [options]
 killall <subcommand> [options]
 ```
 
@@ -51,6 +52,7 @@ By default `killall` only **lists** matching processes (dry-run) and never kills
 | `notepad` | Substring (case-insensitive) | matches `notepad.exe` |
 | `note*` | Glob wildcard | matches `notepad.exe`, `notepadpp.exe` |
 | `/^steam/` | Regex | matches processes starting with `steam` |
+| `4321` | PID (all-numeric arguments) | kills PID 4321 exactly |
 
 ### Options
 
@@ -89,6 +91,10 @@ restart <name>        Kill a process then relaunch it
 ```bat
 :: Kill all Notepad windows
 killall notepad -y
+
+:: Kill by PID (all-numeric arguments match PIDs exactly)
+killall 4321 -y
+killall 4321 8765 -y
 
 :: Kill Chrome and every child process it spawned
 killall chrome --tree -y

@@ -46,6 +46,15 @@ if(BUILD_TESTING)
     add_test(NAME killall_rejects_invalid_port COMMAND killall --port 70000 --dry-run)
     set_tests_properties(killall_rejects_invalid_port PROPERTIES WILL_FAIL TRUE)
 
+    # Numeric positional arguments are treated as PIDs. A PID above the DWORD
+    # range can never exist, so this must list nothing and exit 0.
+    add_test(NAME killall_pid_no_match COMMAND killall 5000000000 --dry-run)
+    # Mixing numeric and non-numeric positional arguments stays an error.
+    add_test(NAME killall_rejects_mixed_pid_and_pattern
+             COMMAND killall 123 notepad --dry-run)
+    set_tests_properties(killall_rejects_mixed_pid_and_pattern
+                         PROPERTIES WILL_FAIL TRUE)
+
     # Unit tests for pure matching/parsing and Windows command-line logic
     add_executable(killall_pattern_tests tests/test_pattern.cpp)
     target_include_directories(killall_pattern_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

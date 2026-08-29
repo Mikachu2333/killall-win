@@ -911,6 +911,9 @@ static DWORD resolveParentPid(const std::string &spec,
 // ─── Args struct ─────────────────────────────────────────────────────────────
 struct Args {
   std::string pattern;
+  // Positional arguments that are entirely numeric; treated as PIDs to kill
+  // exactly (mutually exclusive with pattern).
+  std::vector<unsigned long long> pids;
   std::string subcommand;
   std::string subArg;
   std::string error;
@@ -938,6 +941,7 @@ static void printHelp() {
   puts("");
   puts(BOLD("USAGE"));
   puts("  killall <pattern> [options]");
+  puts("  killall <pid> [<pid> ...] [options]");
   puts("  killall <subcommand> [options]");
   puts("  (Default: dry-run; add -y to actually kill)");
   puts("  (Prompts to elevate when targets need administrator rights)");
@@ -947,6 +951,7 @@ static void printHelp() {
   puts("  part        Substring match");
   puts("  note*       Glob wildcard");
   puts("  /regex/     Regex match");
+  puts("  1234        All-numeric arguments are matched as PIDs exactly");
   puts("");
   puts(BOLD("OPTIONS"));
   puts("  -t, --tree               Kill process tree");
@@ -974,6 +979,8 @@ static void printHelp() {
   puts("");
   puts(BOLD("EXAMPLES"));
   puts("  killall notepad");
+  puts("  killall 4321 -y");
+  puts("  killall 4321 8765 -y");
   puts("  killall chrome -t");
   puts("  killall -p 8080");
   puts("  killall -c /server/");
@@ -1068,9 +1075,24 @@ static Args parseArgs(int argc, char **argv) {
     if (!acceptsArgument && !a.subArg.empty())
       a.error = "subcommand '" + a.subcommand + "' takes no argument";
   } else if (!pos.empty()) {
-    a.pattern = pos.front();
-    if (pos.size() > 1)
-      a.error = "too many positional arguments";
+    // All-numeric positional arguments select processes by PID exactly
+    // (e.g. "killall 1234 5678"). Any non-numeric argument falls back to the
+    // legacy behavior: first argument is a name pattern, extras are an error.
+    bool allNumeric = true;
+    for (const auto &p : pos) {
+      unsigned long long pid = 0;
+      if (!parseULongLong(p, pid)) {
+        allNumeric = false;
+        break;
+      }
+      a.pids.push_back(pid);
+    }
+    if (!allNumeric) {
+      a.pids.clear();
+      a.pattern = pos.front();
+      if (pos.size() > 1)
+        a.error = "too many positional arguments";
+    }
   }
   return a;
 }
@@ -1240,6 +1262,10 @@ static std::vector<ProcInfo> filterProcs(const std::vector<ProcInfo> &all,
   for (auto &p : all) {
     if (p.pid == 0 || p.pid == 4)
       continue;
+    if (!a.pids.empty())
+      if (std::find(a.pids.begin(), a.pids.end(),
+                    static_cast<unsigned long long>(p.pid)) == a.pids.end())
+        continue;
     if (!a.pattern.empty()) {
       std::string noExt = p.name;
       if (noExt.size() > 4 && noExt.substr(noExt.size() - 4) == ".exe")
@@ -1538,9 +1564,10 @@ int wmain(int argc, wchar_t **wargv) {
     else if (a.subcommand == "restart")
       ret = cmdRestart(a, allProcs);
   } else {
-    bool hasFilter = !a.pattern.empty() || !a.cmdlinePat.empty() ||
-                     !a.modulePat.empty() || !a.portSpec.empty() ||
-                     !a.windowPat.empty() || !a.parentSpec.empty();
+    bool hasFilter = !a.pattern.empty() || !a.pids.empty() ||
+                     !a.cmdlinePat.empty() || !a.modulePat.empty() ||
+                     !a.portSpec.empty() || !a.windowPat.empty() ||
+                     !a.parentSpec.empty();
     if (!hasFilter) {
       fprintf(stderr, RED("  Error:") " no pattern or filter specified. Use -h "
                                       "for help.\n");
