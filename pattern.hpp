@@ -45,6 +45,14 @@ inline bool globMatch(const std::string &pat, const std::string &str) {
   return pi == p.size();
 }
 
+// Strip a trailing ".exe" (any case) so "explorer" and "explorer.exe" match
+// the same way everywhere.
+inline std::string stripExeSuffix(const std::string &name) {
+  if (name.size() > 4 && toLower(name.substr(name.size() - 4)) == ".exe")
+    return name.substr(0, name.size() - 4);
+  return name;
+}
+
 // ─── Safe numeric parsing helpers ────────────────────────────────────────────
 inline bool parseLong(const std::string &s, long &out) {
   if (s.empty())

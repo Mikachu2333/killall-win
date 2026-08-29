@@ -184,8 +184,11 @@ static void enrichBasic(ProcInfo &p) {
     }
   }
 
-  auto memoryHandle = makeHandle(
-      OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, p.pid));
+  // GetProcessMemoryInfo only needs PROCESS_QUERY_LIMITED_INFORMATION
+  // (Vista+). Requesting the wider QUERY_INFORMATION | VM_READ rights would
+  // fail for processes in other sessions and hide their memory from ramhog.
+  auto memoryHandle =
+      makeHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, p.pid));
   if (memoryHandle) {
     PROCESS_MEMORY_COUNTERS pmc{};
     if (GetProcessMemoryInfo(static_cast<HANDLE>(memoryHandle.get()), &pmc,
@@ -214,8 +217,9 @@ static bool g_cmdlineCacheFailed = false;
 static void buildCmdlineCache() {
   if (g_cmdlineCacheBuilt || g_cmdlineCacheFailed)
     return;
-  // g_cmdlineCacheBuilt is only set on success so a transient WMI failure is
-  // retried on the next getCmdline() call instead of silently caching nothing.
+  // Any WMI failure marks the cache as failed for the rest of the run:
+  // retrying on every getCmdline() call would pay the WMI latency each time,
+  // so getCmdline() prints a one-time warning instead.
 
   IWbemLocator *rawLocator = nullptr;
   if (FAILED(CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
@@ -303,7 +307,7 @@ static void buildCmdlineCache() {
 
 static std::string getCmdline(DWORD pid) {
   buildCmdlineCache();
-  if (!g_cmdlineCacheBuilt && g_cmdlineCacheFailed) {
+  if (g_cmdlineCacheFailed) {
     static bool warned = false;
     if (!warned) {
       warned = true;
@@ -337,8 +341,9 @@ template <typename Fn> static bool forEachModule(DWORD pid, Fn &&fn) {
   return found;
 }
 
-static bool processHasModule(DWORD pid, const std::string &modPat) {
-  Pattern pat(modPat);
+// The caller builds the Pattern once so /regex/ patterns are compiled once
+// for the whole scan instead of once per process.
+static bool processHasModule(DWORD pid, const Pattern &pat) {
   return forEachModule(pid, [&pat](const MODULEENTRY32W &me) {
     const std::string name = toLower(toNarrow(me.szModule));
     const std::string path = toLower(toNarrow(me.szExePath));
@@ -405,7 +410,14 @@ static bool tableHasPort(const std::vector<BYTE> &buf, DWORD pid, int portLo,
   if (buf.size() < sizeof(Table))
     return false;
   const auto *table = reinterpret_cast<const Table *>(buf.data());
-  for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+  // sizeof(Table) includes one inline row, so clamp the iteration to the rows
+  // the snapshot can actually hold; a malformed dwNumEntries must never walk
+  // past the buffer.
+  const size_t capacityRows =
+      (buf.size() - sizeof(Table)) / sizeof(table->table[0]) + 1;
+  const DWORD count =
+      std::min<DWORD>(table->dwNumEntries, static_cast<DWORD>(capacityRows));
+  for (DWORD i = 0; i < count; ++i) {
     const auto &row = table->table[i];
     if (row.dwOwningPid == pid) {
       const int lp =
@@ -429,9 +441,12 @@ static bool processHasAnyNetwork(DWORD pid) {
 }
 
 // ─── Window title ────────────────────────────────────────────────────────────
+// The Pattern is precompiled by the caller and passed by pointer through the
+// LPARAM: EnumWindows callbacks fire once per top-level window, so building
+// the Pattern inside the callback would recompile /regex/ patterns per window.
 struct WinEnumCtx {
   DWORD pid;
-  std::string pat;
+  const Pattern *pat;
   bool found;
 };
 static BOOL CALLBACK enumWinProc(HWND hwnd, LPARAM lp) {
@@ -446,9 +461,8 @@ static BOOL CALLBACK enumWinProc(HWND hwnd, LPARAM lp) {
     // does not post WM_GETTEXT -- so it cannot block on a hung window, unlike
     // SendMessageTimeout(WM_GETTEXT) which would time out before matching.
     wchar_t title[512] = {};
-    if (GetWindowTextW(hwnd, title, 511) > 0) {
-      Pattern p(ctx->pat);
-      if (p.match(toNarrow(title))) {
+    if (GetWindowTextW(hwnd, title, 512) > 0) {
+      if (ctx->pat->match(toNarrow(title))) {
         ctx->found = true;
         return FALSE;
       }
@@ -456,8 +470,8 @@ static BOOL CALLBACK enumWinProc(HWND hwnd, LPARAM lp) {
   }
   return TRUE;
 }
-static bool processHasWindow(DWORD pid, const std::string &pat) {
-  WinEnumCtx ctx = {pid, pat, false};
+static bool processHasWindow(DWORD pid, const Pattern &pat) {
+  WinEnumCtx ctx = {pid, &pat, false};
   EnumWindows(enumWinProc, reinterpret_cast<LPARAM>(&ctx));
   return ctx.found;
 }
@@ -528,8 +542,9 @@ measureCpuUsage(int sampleSecs, const std::vector<ProcInfo> &allProcs) {
   ULONGLONG wallEnd = 0;
   if (!QueryUnbiasedInterruptTime(&wallEnd))
     wallEnd = GetTickCount64() * 10000ULL;
-  // QueryUnbiasedInterruptTime is in 100ns units like GetProcessTimes, and it
-  // keeps counting while the machine sleeps (GetTickCount64 does not).
+  // QueryUnbiasedInterruptTime is in 100ns units like GetProcessTimes and
+  // excludes time spent in sleep or hibernation (GetTickCount64 keeps counting
+  // through sleep), so a suspended machine does not inflate the denominator.
   const ULONGLONG wallDiff = wallEnd - wallStart;
 
   std::map<DWORD, double> result;
@@ -614,9 +629,7 @@ static const char *AI_CMDLINE_KEYWORDS[] = {".gguf",
                                             nullptr};
 
 static bool isLLMProcess(const ProcInfo &p) {
-  std::string n = toLower(p.name);
-  if (n.size() > 4 && n.substr(n.size() - 4) == ".exe")
-    n = n.substr(0, n.size() - 4);
+  const std::string n = stripExeSuffix(toLower(p.name));
   for (int i = 0; LLM_KEYWORDS[i]; i++)
     if (n.find(LLM_KEYWORDS[i]) != std::string::npos)
       return true;
@@ -664,9 +677,7 @@ static const char *GAME_NAMES[] = {"steam",
                                    nullptr};
 
 static bool isGameProcess(const ProcInfo &p) {
-  std::string n = toLower(p.name);
-  if (n.size() > 4 && n.substr(n.size() - 4) == ".exe")
-    n = n.substr(0, n.size() - 4);
+  const std::string n = stripExeSuffix(toLower(p.name));
   for (int i = 0; GAME_NAMES[i]; i++)
     if (n.find(GAME_NAMES[i]) != std::string::npos)
       return true;
@@ -889,17 +900,10 @@ static DWORD resolveParentPid(const std::string &spec,
                ? pid
                : 0;
   }
-  std::string lower = toLower(spec);
-  // Accept both "explorer" and "explorer.exe" for symmetry with the name
-  // matching used everywhere else.
-  if (lower.size() > 4 && lower.compare(lower.size() - 4, 4, ".exe") == 0)
-    lower.resize(lower.size() - 4);
+  const std::string lower = stripExeSuffix(toLower(spec));
   DWORD result = 0;
   for (const auto &process : all) {
-    std::string name = process.name;
-    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".exe") == 0)
-      name.resize(name.size() - 4);
-    if (name == lower) {
+    if (stripExeSuffix(process.name) == lower) {
       if (result != 0)
         return 0; // Ambiguous names are unsafe.
       result = process.pid;
@@ -1267,10 +1271,7 @@ static std::vector<ProcInfo> filterProcs(const std::vector<ProcInfo> &all,
                     static_cast<unsigned long long>(p.pid)) == a.pids.end())
         continue;
     if (!a.pattern.empty()) {
-      std::string noExt = p.name;
-      if (noExt.size() > 4 && noExt.substr(noExt.size() - 4) == ".exe")
-        noExt = noExt.substr(0, noExt.size() - 4);
-      if (!namePat.match(p.name) && !namePat.match(noExt))
+      if (!namePat.match(p.name) && !namePat.match(stripExeSuffix(p.name)))
         continue;
     }
     if (!a.cmdlinePat.empty()) {
@@ -1278,13 +1279,13 @@ static std::vector<ProcInfo> filterProcs(const std::vector<ProcInfo> &all,
         continue;
     }
     if (!a.modulePat.empty())
-      if (!processHasModule(p.pid, a.modulePat))
+      if (!processHasModule(p.pid, modulePat))
         continue;
     if (filterPort)
       if (!processHasPort(p.pid, portLo, portHi))
         continue;
     if (!a.windowPat.empty())
-      if (!processHasWindow(p.pid, a.windowPat))
+      if (!processHasWindow(p.pid, windowPat))
         continue;
     if (parentPid != 0)
       if (p.ppid != parentPid)
@@ -1437,17 +1438,10 @@ static int cmdRestart(const Args &a, const std::vector<ProcInfo> &all) {
     fprintf(stderr, RED("  Error:") " restart requires <name>\n");
     return 1;
   }
-  std::string nameArg = toLower(a.subArg);
-  // Accept both "explorer" and "explorer.exe" for symmetry with the name
-  // matching used everywhere else.
-  if (nameArg.size() > 4 && nameArg.substr(nameArg.size() - 4) == ".exe")
-    nameArg = nameArg.substr(0, nameArg.size() - 4);
+  const std::string nameArg = stripExeSuffix(toLower(a.subArg));
   std::vector<ProcInfo> targets;
   for (auto p : all) {
-    std::string n = p.name;
-    if (n.size() > 4 && n.substr(n.size() - 4) == ".exe")
-      n = n.substr(0, n.size() - 4);
-    if (n.find(nameArg) != std::string::npos) {
+    if (stripExeSuffix(p.name).find(nameArg) != std::string::npos) {
       enrichBasic(p);
       targets.push_back(p);
     }
@@ -1520,8 +1514,9 @@ int wmain(int argc, wchar_t **wargv) {
 
   // --version / -V exits immediately before any other processing; a "--"
   // separator means the remaining arguments are positional, not options.
+  // argv already holds the UTF-8 conversion done above.
   for (int i = 1; i < argc; i++) {
-    std::string arg = toNarrow(wargv[i]);
+    const std::string arg = argv[i];
     if (arg == "--")
       break;
     if (arg == "-V" || arg == "--version") {

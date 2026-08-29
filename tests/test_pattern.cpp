@@ -133,6 +133,19 @@ static void testToLower() {
   CHECK(toLower("ABC123") == "abc123");
 }
 
+static void testStripExeSuffix() {
+  CHECK(stripExeSuffix("notepad.exe") == "notepad");
+  CHECK(stripExeSuffix("NOTEPAD.EXE") == "NOTEPAD");
+  CHECK(stripExeSuffix("explorer") == "explorer");
+  CHECK(stripExeSuffix("") == "");
+  // Only a *trailing* ".exe" is stripped, and only after at least one
+  // character of base name.
+  CHECK(stripExeSuffix(".exe") == ".exe");
+  CHECK(stripExeSuffix("a.exe") == "a");
+  CHECK(stripExeSuffix("exe") == "exe");
+  CHECK(stripExeSuffix("notepad.exe.bak") == "notepad.exe.bak");
+}
+
 int main() {
   testGlobMatch();
   testPattern();
@@ -140,6 +153,7 @@ int main() {
   testParseULongLong();
   testParseDouble();
   testToLower();
+  testStripExeSuffix();
   if (g_failures == 0)
     std::printf("All pattern tests passed.\n");
   else
