@@ -31,10 +31,10 @@ Single-file project at [killall.cpp](killall.cpp). A `killall`-like Windows proc
 
 **Process enumeration and filtering pipeline:**
 
-1. `enumProcesses()` — `CreateToolhelp32Snapshot` for PID/name/PPID
-2. `enrichBasic()` — `OpenProcess` + `QueryFullProcessImageNameW` + `GetProcessMemoryInfo` for exe path and working set
+1. `enumProcesses()` — `SystemProcessInformation` supplies PID, creation time, name, parent, CPU times and working set in one snapshot. Its fixed prefix on Windows 7+ places creation, user and kernel times after the first 24 bytes of `Reserved1`. `Reserved2` holds the parent PID. The reader checks its own creation time against `GetProcessTimes` before accepting the snapshot.
+2. `processPath()` — reads the executable path from the process handle used to verify identity
 3. `filterProcs()` — applies name, cmdline (WMI cache), module, port, window-title, and parent filters
-4. `doKill()` — prints list, sorts children-before-parents, calls `TerminateProcess`. Default is a dry run; `-y/--yes` (alias `-f`) executes the kill. When a target cannot be opened for termination it may ask once to relaunch elevated via `ShellExecuteW("runas")`; the `KILLALL_ELEVATED` env marker records an attempted relaunch, while a `TOKEN_ELEVATION` check determines actual elevation
+4. `doKill()` — prints the targets and orders children before parents. The default is a dry run. `-y/--yes` (alias `-f`) executes. An interactive UAC retry uses `ShellExecuteExW` with the fixed identities from `target_plan.hpp`. The worker verifies `TokenElevation` and executes those identities directly. The parent propagates its exit code.
 
 **WMI command-line cache**: Lazily built via `IWbemServices::ExecQuery`. COM initialized in `wmain()` with matching `CoUninitialize()` on exit.
 
@@ -45,10 +45,10 @@ Single-file project at [killall.cpp](killall.cpp). A `killall`-like Windows proc
 - `hung` — `SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG, 2000ms)` on process windows
 - `networkapps` — any process with a TCP/UDP port open
 - `ramhog <MB>` — `WorkingSetSize > threshold`, sorted descending, optional `--top N`
-- `cpuhog <percent>` — two-snapshot CPU measurement via `GetProcessTimes` with configurable sleep (`--sample`), optional `--top N`
+- `cpuhog <percent>` — two-snapshot CPU measurement by PID and creation time with configurable sleep (`--sample`), optional `--top N`
 - `gpu` — checks loaded modules against known GPU DLLs
 - `llm` — matches process name + command-line against AI/LLM keywords
 - `game` — matches process name + loaded modules against game launcher/SDK names
-- `restart <name>` — kills then `ShellExecuteA` re-launches
+- `restart <name>` — the original caller uses `ShellExecuteW` to relaunch the verified executable after successful termination
 
 **Safe numeric parsing**: `parseLong()`, `parseULongLong()`, `parseDouble()` — wrappers around `strtol`/`strtoull`/`strtod` with `errno` and end-pointer validation. Used for all CLI numeric arguments.

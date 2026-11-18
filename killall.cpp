@@ -16,14 +16,15 @@
 #include <windows.h>
 #include <iphlpapi.h>
 #include <objbase.h>
-#include <psapi.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <wbemidl.h>
+#include <winternl.h>
 
 #include "version.hpp"
 #include "command_line.hpp"
 #include "pattern.hpp"
+#include "target_plan.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -36,6 +37,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <set>
 #include <string>
@@ -44,7 +46,6 @@
 #include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "ole32.lib")
@@ -128,73 +129,98 @@ static std::wstring toWide(const std::string &s) {
 // parseDouble, Pattern) lives in pattern.hpp so it can be unit-tested.
 
 // ─── Process info struct ─────────────────────────────────────────────────────
-struct ProcInfo {
-  DWORD pid = 0;
+struct ProcInfo : ProcessIdentity {
   DWORD ppid = 0;
   std::string name;
-  std::string exePath;
   SIZE_T workingSetBytes = 0;
+  ULONGLONG cpuTime = 0;
   double cpuPercent = 0.0;
-  ULONGLONG creationTime = 0;
 };
 
 // ─── Enumerate all processes ─────────────────────────────────────────────────
-static std::vector<ProcInfo> enumProcesses() {
-  std::vector<ProcInfo> procs;
-  auto snap = makeHandle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-  if (!snap) {
-    fprintf(stderr,
-            RED("  Warning:") " process snapshot failed (Windows error %lu); "
-                              "no processes will be matched\n",
-            static_cast<unsigned long>(GetLastError()));
-    return procs;
+static ULONGLONG creationTimeOf(HANDLE handle);
+
+static bool enumProcesses(std::vector<ProcInfo> &processes) {
+  struct Times {
+    BYTE accounting[24];
+    LARGE_INTEGER created, user, kernel;
+  };
+  static_assert(sizeof(Times) == sizeof(SYSTEM_PROCESS_INFORMATION::Reserved1));
+  const auto query =
+      reinterpret_cast<decltype(&NtQuerySystemInformation)>(GetProcAddress(
+          GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+  if (!query)
+    return false;
+  std::vector<BYTE> buffer(256 * 1024);
+  ULONG used = 0;
+  for (;;) {
+    const NTSTATUS status = query(SystemProcessInformation, buffer.data(),
+                                  static_cast<ULONG>(buffer.size()), &used);
+    if (status >= 0)
+      break;
+    if (status != static_cast<NTSTATUS>(0xC0000004L) || used > ULONG_MAX / 2 ||
+        buffer.size() > ULONG_MAX / 2)
+      return false;
+    buffer.resize(std::max<size_t>(used, buffer.size() * 2));
   }
-  PROCESSENTRY32W pe;
-  pe.dwSize = sizeof(pe);
-  if (Process32FirstW(static_cast<HANDLE>(snap.get()), &pe)) {
-    do {
-      ProcInfo p;
-      p.pid = pe.th32ProcessID;
-      p.ppid = pe.th32ParentProcessID;
-      p.name = toLower(toNarrow(pe.szExeFile));
-      procs.push_back(p);
-    } while (Process32NextW(static_cast<HANDLE>(snap.get()), &pe));
+  if (used > buffer.size())
+    return false;
+  size_t offset = 0;
+  bool verifiedLayout = false;
+  while (used - offset >= sizeof(SYSTEM_PROCESS_INFORMATION)) {
+    const auto *entry = reinterpret_cast<const SYSTEM_PROCESS_INFORMATION *>(
+        buffer.data() + offset);
+    ProcInfo process;
+    process.pid = HandleToULong(entry->UniqueProcessId);
+    process.ppid = HandleToULong(entry->Reserved2);
+    Times times{};
+    std::memcpy(&times, entry->Reserved1, sizeof(times));
+    process.creationTime = static_cast<ULONGLONG>(times.created.QuadPart);
+    if (process.pid == GetCurrentProcessId())
+      verifiedLayout =
+          process.creationTime &&
+          process.creationTime == creationTimeOf(GetCurrentProcess());
+    process.cpuTime =
+        static_cast<ULONGLONG>(times.user.QuadPart) + times.kernel.QuadPart;
+    process.workingSetBytes = entry->WorkingSetSize;
+    const auto &name = entry->ImageName;
+    if (name.Length) {
+      const auto begin = reinterpret_cast<uintptr_t>(buffer.data());
+      const auto address = reinterpret_cast<uintptr_t>(name.Buffer);
+      if (address < begin || address - begin > used ||
+          name.Length > used - (address - begin) ||
+          name.Length % sizeof(wchar_t) != 0)
+        return false;
+      process.name = toLower(
+          toNarrow(std::wstring(name.Buffer, name.Length / sizeof(wchar_t))));
+    }
+    processes.push_back(std::move(process));
+    if (!entry->NextEntryOffset)
+      return verifiedLayout;
+    if (entry->NextEntryOffset < sizeof(*entry) ||
+        entry->NextEntryOffset > used - offset ||
+        entry->NextEntryOffset % alignof(SYSTEM_PROCESS_INFORMATION) != 0)
+      return false;
+    offset += entry->NextEntryOffset;
   }
-  return procs;
+  return false;
 }
 
-// get memory and exe path
-static void enrichBasic(ProcInfo &p) {
-  auto queryHandle =
-      makeHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, p.pid));
-  if (queryHandle) {
-    std::vector<wchar_t> path(32768);
-    DWORD size = static_cast<DWORD>(path.size());
-    if (QueryFullProcessImageNameW(static_cast<HANDLE>(queryHandle.get()), 0,
-                                   path.data(), &size))
-      p.exePath = toNarrow(std::wstring(path.data(), size));
+static ULONGLONG creationTimeOf(HANDLE handle) {
+  FILETIME created{}, exited{}, kernel{}, user{};
+  if (!GetProcessTimes(handle, &created, &exited, &kernel, &user))
+    return 0;
+  return (static_cast<ULONGLONG>(created.dwHighDateTime) << 32) |
+         created.dwLowDateTime;
+}
 
-    FILETIME created{}, exited{}, kernel{}, user{};
-    if (GetProcessTimes(static_cast<HANDLE>(queryHandle.get()), &created,
-                        &exited, &kernel, &user)) {
-      ULARGE_INTEGER value{};
-      value.LowPart = created.dwLowDateTime;
-      value.HighPart = created.dwHighDateTime;
-      p.creationTime = value.QuadPart;
-    }
-  }
-
-  // GetProcessMemoryInfo only needs PROCESS_QUERY_LIMITED_INFORMATION
-  // (Vista+). Requesting the wider QUERY_INFORMATION | VM_READ rights would
-  // fail for processes in other sessions and hide their memory from ramhog.
-  auto memoryHandle =
-      makeHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, p.pid));
-  if (memoryHandle) {
-    PROCESS_MEMORY_COUNTERS pmc{};
-    if (GetProcessMemoryInfo(static_cast<HANDLE>(memoryHandle.get()), &pmc,
-                             sizeof(pmc)))
-      p.workingSetBytes = pmc.WorkingSetSize;
-  }
+static std::wstring processPath(HANDLE handle) {
+  std::wstring path(32768, L'\0');
+  DWORD size = static_cast<DWORD>(path.size());
+  if (!QueryFullProcessImageNameW(handle, 0, path.data(), &size))
+    return {};
+  path.resize(size);
+  return path;
 }
 
 // ─── WMI command-line cache ──────────────────────────────────────────────────
@@ -213,6 +239,7 @@ using UniqueBstr = std::unique_ptr<wchar_t, BstrDeleter>;
 static std::map<DWORD, std::string> g_cmdlineCache;
 static bool g_cmdlineCacheBuilt = false;
 static bool g_cmdlineCacheFailed = false;
+static std::set<DWORD> unreadableProcesses;
 
 static void buildCmdlineCache() {
   if (g_cmdlineCacheBuilt || g_cmdlineCacheFailed)
@@ -277,9 +304,11 @@ static void buildCmdlineCache() {
     ULONG returned = 0;
     hr = enumerator->Next(5000, 1, &rawObject, &returned);
     UniqueCom<IWbemClassObject> object(rawObject);
-    if (hr == WBEM_S_TIMEDOUT || returned == 0)
+    if (FAILED(hr) || hr == WBEM_S_TIMEDOUT) {
+      g_cmdlineCacheFailed = true;
       break;
-    if (FAILED(hr) || !object)
+    }
+    if (!returned || !object)
       break;
 
     VARIANT pidValue{};
@@ -297,7 +326,11 @@ static void buildCmdlineCache() {
       const DWORD pid = pidValue.vt == VT_UI4
                             ? pidValue.ulVal
                             : static_cast<DWORD>(pidValue.lVal);
-      g_cmdlineCache[pid] = toNarrow(commandValue.bstrVal);
+      const std::wstring wide(commandValue.bstrVal,
+                              SysStringLen(commandValue.bstrVal));
+      auto text = toNarrow(wide);
+      if (!text.empty() || wide.empty())
+        g_cmdlineCache.emplace(pid, std::move(text));
     }
     VariantClear(&pidValue);
     VariantClear(&commandValue);
@@ -305,19 +338,20 @@ static void buildCmdlineCache() {
   g_cmdlineCacheBuilt = true;
 }
 
-static std::string getCmdline(DWORD pid) {
+static const std::string *getCmdline(DWORD pid) {
   buildCmdlineCache();
   if (g_cmdlineCacheFailed) {
     static bool warned = false;
     if (!warned) {
       warned = true;
-      fprintf(stderr,
-              RED("  Warning:") " WMI command-line query failed; --cmdline "
-                                "matching will return no results\n");
+      fprintf(stderr, RED("  Warning:") " WMI command-line query incomplete\n");
     }
   }
   auto it = g_cmdlineCache.find(pid);
-  return it != g_cmdlineCache.end() ? it->second : "";
+  if (it != g_cmdlineCache.end())
+    return &it->second;
+  unreadableProcesses.insert(pid);
+  return nullptr;
 }
 
 // ─── Loaded modules ──────────────────────────────────────────────────────────
@@ -325,8 +359,11 @@ static std::string getCmdline(DWORD pid) {
 template <typename Fn> static bool forEachModule(DWORD pid, Fn &&fn) {
   auto snap = makeHandle(
       CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid));
-  if (!snap)
+  if (!snap) {
+    if (GetLastError() != ERROR_INVALID_PARAMETER)
+      unreadableProcesses.insert(pid);
     return false;
+  }
   MODULEENTRY32W me{};
   me.dwSize = sizeof(me);
   bool found = false;
@@ -338,6 +375,8 @@ template <typename Fn> static bool forEachModule(DWORD pid, Fn &&fn) {
       }
     } while (Module32NextW(static_cast<HANDLE>(snap.get()), &me));
   }
+  if (!found && GetLastError() != ERROR_NO_MORE_FILES)
+    unreadableProcesses.insert(pid);
   return found;
 }
 
@@ -494,8 +533,15 @@ static BOOL CALLBACK enumHungProc(HWND hwnd, LPARAM lp) {
     // GetLastError is NOT a reliable hung indicator here: when
     // SMTO_ABORTIFHUNG bails out early on a hung thread it returns 0 while
     // leaving GetLastError at ERROR_SUCCESS on current Windows versions.
+    SetLastError(ERROR_SUCCESS);
     if (SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK,
                             2000, &result) == 0) {
+      const auto error = GetLastError();
+      if (error != ERROR_SUCCESS && error != ERROR_TIMEOUT) {
+        if (error == ERROR_ACCESS_DENIED)
+          unreadableProcesses.insert(wpid);
+        return TRUE;
+      }
       ctx->hung = true;
       return FALSE;
     }
@@ -509,69 +555,33 @@ static bool isProcessHung(DWORD pid) {
 }
 
 // ─── CPU usage (two-snapshot) ────────────────────────────────────────────────
-static std::map<DWORD, double>
+static std::optional<std::map<DWORD, double>>
 measureCpuUsage(int sampleSecs, const std::vector<ProcInfo> &allProcs) {
-  struct CpuSnapshot {
-    ULONGLONG creation = 0;
-    ULONGLONG cpu = 0;
-  };
-  std::map<DWORD, CpuSnapshot> first;
-  for (const auto &process : allProcs) {
-    auto handle = makeHandle(
-        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process.pid));
-    if (!handle)
-      continue;
-    FILETIME created{}, exited{}, kernel{}, user{};
-    if (GetProcessTimes(static_cast<HANDLE>(handle.get()), &created, &exited,
-                        &kernel, &user)) {
-      ULARGE_INTEGER c{}, k{}, u{};
-      c.LowPart = created.dwLowDateTime;
-      c.HighPart = created.dwHighDateTime;
-      k.LowPart = kernel.dwLowDateTime;
-      k.HighPart = kernel.dwHighDateTime;
-      u.LowPart = user.dwLowDateTime;
-      u.HighPart = user.dwHighDateTime;
-      first[process.pid] = {c.QuadPart, k.QuadPart + u.QuadPart};
-    }
-  }
+  std::map<DWORD, const ProcInfo *> first;
+  for (const auto &process : allProcs)
+    first.emplace(process.pid, &process);
   ULONGLONG wallStart = 0;
   if (!QueryUnbiasedInterruptTime(&wallStart))
-    wallStart = GetTickCount64() * 10000ULL; // fallback: ms -> 100ns
+    return std::nullopt;
   printf(YELLOW("  Sampling CPU for %d second(s)...\n"), sampleSecs);
   Sleep(static_cast<DWORD>(sampleSecs) * 1000U);
   ULONGLONG wallEnd = 0;
-  if (!QueryUnbiasedInterruptTime(&wallEnd))
-    wallEnd = GetTickCount64() * 10000ULL;
-  // QueryUnbiasedInterruptTime is in 100ns units like GetProcessTimes and
-  // excludes time spent in sleep or hibernation (GetTickCount64 keeps counting
-  // through sleep), so a suspended machine does not inflate the denominator.
+  std::vector<ProcInfo> second;
+  if (!enumProcesses(second) || !QueryUnbiasedInterruptTime(&wallEnd) ||
+      wallEnd <= wallStart)
+    return std::nullopt;
   const ULONGLONG wallDiff = wallEnd - wallStart;
 
   std::map<DWORD, double> result;
-  for (const auto &process : allProcs) {
+  for (const auto &process : second) {
     const auto previous = first.find(process.pid);
-    if (previous == first.end())
+    if (previous == first.end() || !process.creationTime ||
+        process.creationTime != previous->second->creationTime ||
+        process.cpuTime < previous->second->cpuTime)
       continue;
-    auto handle = makeHandle(
-        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process.pid));
-    if (!handle)
-      continue;
-    FILETIME created{}, exited{}, kernel{}, user{};
-    if (!GetProcessTimes(static_cast<HANDLE>(handle.get()), &created, &exited,
-                         &kernel, &user))
-      continue;
-    ULARGE_INTEGER c{}, k{}, u{};
-    c.LowPart = created.dwLowDateTime;
-    c.HighPart = created.dwHighDateTime;
-    k.LowPart = kernel.dwLowDateTime;
-    k.HighPart = kernel.dwHighDateTime;
-    u.LowPart = user.dwLowDateTime;
-    u.HighPart = user.dwHighDateTime;
-    const ULONGLONG cpu = k.QuadPart + u.QuadPart;
-    if (wallDiff > 0 && c.QuadPart == previous->second.creation &&
-        cpu >= previous->second.cpu)
-      result[process.pid] = static_cast<double>(cpu - previous->second.cpu) /
-                            static_cast<double>(wallDiff) * 100.0;
+    result[process.pid] =
+        static_cast<double>(process.cpuTime - previous->second->cpuTime) /
+        static_cast<double>(wallDiff) * 100.0;
   }
   return result;
 }
@@ -633,9 +643,10 @@ static bool isLLMProcess(const ProcInfo &p) {
   for (int i = 0; LLM_KEYWORDS[i]; i++)
     if (n.find(LLM_KEYWORDS[i]) != std::string::npos)
       return true;
-  std::string cmd = toLower(getCmdline(p.pid));
-  if (cmd.empty())
+  const auto *command = getCmdline(p.pid);
+  if (!command)
     return false;
+  const std::string cmd = toLower(*command);
   for (int i = 0; AI_CMDLINE_KEYWORDS[i]; i++)
     if (cmd.find(AI_CMDLINE_KEYWORDS[i]) != std::string::npos)
       return true;
@@ -691,31 +702,24 @@ static bool isGameProcess(const ProcInfo &p) {
 }
 
 // ─── Process tree ────────────────────────────────────────────────────────────
-static std::set<DWORD> getProcessTree(DWORD rootPid,
+static std::set<DWORD> getProcessTree(const ProcInfo &root,
                                       const std::vector<ProcInfo> &all) {
   std::set<DWORD> tree;
-  std::vector<DWORD> queue = {rootPid};
+  std::vector<const ProcInfo *> queue = {&root};
   while (!queue.empty()) {
-    DWORD cur = queue.back();
+    const auto &parent = *queue.back();
     queue.pop_back();
-    if (!tree.insert(cur).second)
+    if (!tree.insert(parent.pid).second)
       continue;
     for (auto &p : all)
-      if (p.ppid == cur && p.pid != cur)
-        queue.push_back(p.pid);
+      if (p.ppid == parent.pid && p.pid != parent.pid && parent.creationTime &&
+          p.creationTime >= parent.creationTime)
+        queue.push_back(&p);
   }
   return tree;
 }
 
 // ─── Elevation (UAC) ─────────────────────────────────────────────────────────
-// Original command line is kept so a relaunched elevated instance can
-// re-execute the same request.
-static int g_argc = 0;
-static wchar_t **g_wargv = nullptr;
-static bool g_relaunchedElevated = false;
-
-// Critical system processes that must never be terminated, even when
-// elevated. process.name is already lower-cased by enumProcesses().
 static const std::set<std::string> &protectedNames() {
   static const std::set<std::string> names = {
       "csrss.exe", "lsass.exe",     "services.exe",
@@ -736,10 +740,19 @@ static bool isElevated() {
          elevation.TokenIsElevated != 0;
 }
 
-static bool elevationWasAttempted() {
-  wchar_t marker[2] = {};
-  return GetEnvironmentVariableW(L"KILLALL_ELEVATED", marker, 2) == 1 &&
-         marker[0] == L'1';
+using CriticalQuery = BOOL(WINAPI *)(HANDLE, PBOOL);
+
+static CriticalQuery criticalQuery() {
+  static const auto query = reinterpret_cast<CriticalQuery>(
+      GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsProcessCritical"));
+  return query;
+}
+
+static UniqueHandle openForTermination(DWORD pid) {
+  const DWORD queryAccess = criticalQuery() ? PROCESS_QUERY_LIMITED_INFORMATION
+                                            : PROCESS_QUERY_INFORMATION;
+  return makeHandle(
+      OpenProcess(PROCESS_TERMINATE | queryAccess | SYNCHRONIZE, FALSE, pid));
 }
 
 // True when at least one target cannot even be opened for termination with
@@ -750,9 +763,7 @@ static bool needsElevation(const std::vector<ProcInfo> &procs) {
   for (const auto &p : procs) {
     if (protectedNames().count(p.name) != 0)
       continue;
-    auto handle = makeHandle(OpenProcess(
-        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-        FALSE, p.pid));
+    auto handle = openForTermination(p.pid);
     if (!handle && GetLastError() == ERROR_ACCESS_DENIED)
       return true;
   }
@@ -797,44 +808,76 @@ static bool getExecutablePath(std::wstring &path) {
   }
 }
 
-// Relaunch this exe with the original command line via ShellExecuteW "runas"
-// (triggers the UAC prompt). Returns false when the user cancels or the
-// relaunch fails, in which case the caller continues with current privileges.
-static bool rerunElevated() {
-  std::wstring exePath;
-  if (!getExecutablePath(exePath))
-    return false;
-  std::wstring cmdline;
-  for (int i = 1; i < g_argc; ++i) {
-    if (i > 1)
-      cmdline += L' ';
-    cmdline += quoteWindowsArg(g_wargv[i]);
+static int childResult(HANDLE child) {
+  DWORD status = 0;
+  if (!child || WaitForSingleObject(child, INFINITE) != WAIT_OBJECT_0 ||
+      !GetExitCodeProcess(child, &status)) {
+    fprintf(stderr, "  Cannot obtain the elevated process result\n");
+    return 2;
   }
-  HINSTANCE result = ShellExecuteW(nullptr, L"runas", exePath.c_str(),
-                                   cmdline.c_str(), nullptr, SW_SHOWNORMAL);
-  return reinterpret_cast<INT_PTR>(result) > 32;
+  return static_cast<int>(status);
+}
+
+static int launchTargetWorker(const std::vector<ProcessIdentity> &targets,
+                              const wchar_t *verb) {
+  std::wstring exePath;
+  if (!getExecutablePath(exePath)) {
+    fprintf(stderr, "  Cannot resolve the executable for elevation\n");
+    return 2;
+  }
+  std::wstring parameters = toWide(planOption);
+  for (const auto &target : targets) {
+    parameters += L' ';
+    parameters += encodeTarget(target);
+  }
+  if (quoteWindowsArg(exePath).size() + parameters.size() + 2 > 32767) {
+    fprintf(stderr, "  Target list exceeds the Windows command-line limit\n");
+    return 2;
+  }
+  SHELLEXECUTEINFOW launch{};
+  launch.cbSize = sizeof(launch);
+  launch.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+  launch.lpVerb = verb;
+  launch.lpFile = exePath.c_str();
+  launch.lpParameters = parameters.c_str();
+  launch.nShow = SW_SHOWNORMAL;
+  if (!ShellExecuteExW(&launch)) {
+    fprintf(stderr, "  Elevation cancelled or failed (Windows error %lu)\n",
+            GetLastError());
+    return 2;
+  }
+  auto child = makeHandle(launch.hProcess);
+  return childResult(child.get());
 }
 
 // ─── Kill a PID ──────────────────────────────────────────────────────────────
-static bool isProtectedProcess(const ProcInfo &process, HANDLE handle) {
-  if (process.pid == 0 || process.pid == 4 ||
-      protectedNames().count(process.name) != 0)
-    return true;
-
-  using IsProcessCriticalFn = BOOL(WINAPI *)(HANDLE, PBOOL);
-  const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
-  const auto isProcessCritical =
-      kernel ? reinterpret_cast<IsProcessCriticalFn>(
-                   GetProcAddress(kernel, "IsProcessCritical"))
-             : nullptr;
+static bool criticalOrUnknown(HANDLE handle, CriticalQuery isProcessCritical) {
   BOOL critical = FALSE;
-  return isProcessCritical && isProcessCritical(handle, &critical) && critical;
+  if (isProcessCritical)
+    return !isProcessCritical(handle, &critical) || critical;
+  const auto query =
+      reinterpret_cast<decltype(&NtQueryInformationProcess)>(GetProcAddress(
+          GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+  ULONG breakOnTermination = 0, returned = 0;
+  return !query ||
+         query(handle, ProcessBreakOnTermination, &breakOnTermination,
+               sizeof(breakOnTermination), &returned) < 0 ||
+         returned != sizeof(breakOnTermination) || breakOnTermination != 0;
 }
 
-static bool killProcess(const ProcInfo &process) {
-  auto handle = makeHandle(OpenProcess(
-      PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-      FALSE, process.pid));
+static bool isProtectedProcess(HANDLE handle) {
+  const auto path = processPath(handle);
+  const auto name =
+      toLower(toNarrow(path.substr(path.find_last_of(L"\\/") + 1)));
+  return name.empty() || protectedNames().count(name) ||
+         criticalOrUnknown(handle, criticalQuery());
+}
+
+static bool killProcess(ProcessIdentity process) {
+  if (process.pid == 0 || process.pid == 4 ||
+      process.pid == GetCurrentProcessId() || !process.creationTime)
+    return false;
+  auto handle = openForTermination(process.pid);
   if (!handle) {
     fprintf(stderr, "  Cannot open PID %lu (Windows error %lu)\n",
             static_cast<unsigned long>(process.pid),
@@ -842,31 +885,15 @@ static bool killProcess(const ProcInfo &process) {
     return false;
   }
 
-  FILETIME created{}, exited{}, kernel{}, user{};
-  ULARGE_INTEGER creation{};
-  if (!GetProcessTimes(static_cast<HANDLE>(handle.get()), &created, &exited,
-                       &kernel, &user)) {
-    fprintf(stderr, "  Cannot verify PID %lu identity (Windows error %lu)\n",
-            static_cast<unsigned long>(process.pid),
-            static_cast<unsigned long>(GetLastError()));
-    return false;
-  }
-  creation.LowPart = created.dwLowDateTime;
-  creation.HighPart = created.dwHighDateTime;
-  if (process.creationTime == 0) {
+  if (creationTimeOf(handle.get()) != process.creationTime) {
     fprintf(stderr,
-            "  Cannot verify PID %lu creation time (insufficient "
-            "permissions?); refusing to kill\n",
+            "  Refusing PID %lu: cannot verify original process identity\n",
             static_cast<unsigned long>(process.pid));
     return false;
   }
-  if (creation.QuadPart != process.creationTime) {
-    fprintf(stderr, "  Refusing PID %lu: process identity changed\n",
-            static_cast<unsigned long>(process.pid));
-    return false;
-  }
-  if (isProtectedProcess(process, static_cast<HANDLE>(handle.get()))) {
-    fprintf(stderr, "  Refusing to terminate protected process PID %lu\n",
+  if (isProtectedProcess(handle.get())) {
+    fprintf(stderr,
+            "  Refusing PID %lu: protected or critical status unknown\n",
             static_cast<unsigned long>(process.pid));
     return false;
   }
@@ -884,6 +911,18 @@ static bool killProcess(const ProcInfo &process) {
     return false;
   }
   return true;
+}
+
+static int executeTargets(const std::vector<ProcessIdentity> &targets) {
+  size_t killed = 0;
+  for (const auto &target : targets) {
+    if (killProcess(target)) {
+      printf("  Killed PID %lu\n", static_cast<unsigned long>(target.pid));
+      ++killed;
+    }
+  }
+  printf("  Done: %zu killed, %zu failed.\n", killed, targets.size() - killed);
+  return killed == targets.size() ? 0 : 2;
 }
 
 // ─── Resolve parent name/pid ─────────────────────────────────────────────────
@@ -926,6 +965,7 @@ struct Args {
   bool force = false;  // -f/--force: alias of -y (backwards compatibility)
   bool dryRun = false; // -n/--dry-run: explicit dry run (default anyway)
   bool help = false;
+  bool version = false;
   std::string cmdlinePat;
   std::string modulePat;
   std::string portSpec;
@@ -970,6 +1010,9 @@ static void printHelp() {
   puts("  -N, --top <N>            Limit ramhog/cpuhog to top N offenders");
   puts("  -s, --sample <N>         CPU sampling interval (seconds)");
   puts("  -h, --help               Show help");
+  puts("  Use --window=-text (or --cmdline=-text) for values starting with "
+       "'-'.");
+  puts("  Process filters apply to pattern/PID mode only.");
   puts("");
   puts(BOLD("SUBCOMMANDS"));
   puts("  hung          Kill hung/frozen apps");
@@ -1007,9 +1050,16 @@ static bool isSubcmd(const std::string &s) {
 static Args parseArgs(int argc, char **argv) {
   Args a;
   std::vector<std::string> pos;
+  bool sampleSpecified = false;
+  std::optional<std::string> attached;
   auto requireValue = [&](int &index, const std::string &option,
                           std::string &destination) {
-    if (index + 1 >= argc || argv[index + 1][0] == '\0') {
+    if (attached && !attached->empty()) {
+      destination = *attached;
+      return true;
+    }
+    if (attached || index + 1 >= argc || argv[index + 1][0] == '\0' ||
+        argv[index + 1][0] == '-') {
       a.error = "option '" + option + "' requires a value";
       return false;
     }
@@ -1018,13 +1068,28 @@ static Args parseArgs(int argc, char **argv) {
   };
 
   for (int i = 1; i < argc && a.error.empty(); ++i) {
-    const std::string arg = argv[i];
+    std::string arg = argv[i];
+    attached.reset();
+    const auto equals = arg.find('=');
+    if (arg.starts_with('-') && equals != std::string::npos) {
+      attached = arg.substr(equals + 1);
+      arg.resize(equals);
+      static const std::set<std::string> valued = {
+          "-w", "--window", "-c", "--cmdline", "-p", "--port", "-m", "--module",
+          "-P", "--parent", "-s", "--sample",  "-N", "--top"};
+      if (!valued.count(arg)) {
+        a.error = "unexpected option '" + std::string(argv[i]) + "'";
+        break;
+      }
+    }
     if (arg == "--") {
       while (++i < argc)
         pos.emplace_back(argv[i]);
       break;
     } else if (arg == "-h" || arg == "--help")
       a.help = true;
+    else if (arg == "-V" || arg == "--version")
+      a.version = true;
     else if (arg == "-t" || arg == "--tree")
       a.killTree = true;
     else if (arg == "-y" || arg == "--yes")
@@ -1054,9 +1119,10 @@ static Args parseArgs(int argc, char **argv) {
         a.error = "invalid value '" + value + "' for option '" + arg + "'";
         continue;
       }
-      if (arg == "-s" || arg == "--sample")
+      if (arg == "-s" || arg == "--sample") {
+        sampleSpecified = true;
         a.sampleSecs = static_cast<int>(parsed);
-      else
+      } else
         a.top = static_cast<int>(parsed);
     } else if (!arg.empty() && arg.front() == '-') {
       a.error = "unknown option '" + arg + "'";
@@ -1098,6 +1164,14 @@ static Args parseArgs(int argc, char **argv) {
         a.error = "too many positional arguments";
     }
   }
+  if (!a.subcommand.empty() &&
+      (!a.cmdlinePat.empty() || !a.modulePat.empty() || !a.windowPat.empty() ||
+       !a.parentSpec.empty() || !a.portSpec.empty()))
+    a.error = "process filters cannot be combined with subcommands";
+  if (a.top && a.subcommand != "ramhog" && a.subcommand != "cpuhog")
+    a.error = "--top requires ramhog or cpuhog";
+  if (sampleSpecified && a.subcommand != "cpuhog")
+    a.error = "--sample requires cpuhog";
   return a;
 }
 
@@ -1105,14 +1179,15 @@ static Args parseArgs(int argc, char **argv) {
 static int doKill(std::vector<ProcInfo> targets, const Args &a,
                   const std::vector<ProcInfo> &allProcs) {
   if (targets.empty()) {
-    printf(YELLOW("  No matching processes found.\n"));
+    puts(unreadableProcesses.empty() ? "  No matching processes found."
+                                     : "  No verified matches.");
     return 0;
   }
   // Expand to process tree
   std::set<DWORD> killSet;
   if (a.killTree) {
     for (auto &p : targets) {
-      auto tree = getProcessTree(p.pid, allProcs);
+      auto tree = getProcessTree(p, allProcs);
       killSet.insert(tree.begin(), tree.end());
     }
   } else {
@@ -1133,8 +1208,6 @@ static int doKill(std::vector<ProcInfo> targets, const Args &a,
     if (it != byPid.end())
       finalList.push_back(*it->second);
   }
-  for (auto &p : finalList)
-    enrichBasic(p);
   if (skippedSelf)
     printf("  " YELLOW("Skipped") "  killall.exe (self)\n");
   if (finalList.empty()) {
@@ -1153,25 +1226,6 @@ static int doKill(std::vector<ProcInfo> targets, const Args &a,
   if (!willKill) {
     printf("  " YELLOW("Dry run: nothing was killed. Use -y to execute.") "\n");
     return 0;
-  }
-
-  // Ask for elevation when current privileges are insufficient. This runs
-  // only in execute mode; dry runs never need to elevate.
-  if (!isElevated() && !elevationWasAttempted() && needsElevation(finalList) &&
-      confirmElevation()) {
-    if (!SetEnvironmentVariableW(L"KILLALL_ELEVATED", L"1")) {
-      fprintf(stderr,
-              "  Cannot set elevation marker (Windows error %lu); "
-              "continuing with current privileges\n",
-              static_cast<unsigned long>(GetLastError()));
-    } else if (rerunElevated()) {
-      g_relaunchedElevated = true;
-      printf("  " YELLOW("Restarting with administrator privileges...") "\n");
-      return 0;
-    } else {
-      printf("  " YELLOW("Elevation cancelled or failed; continuing with "
-                         "current privileges.") "\n");
-    }
   }
 
   // Compute bounded depths. A corrupt/racy parent snapshot may contain a
@@ -1198,20 +1252,10 @@ static int doKill(std::vector<ProcInfo> targets, const Args &a,
               return depthOf(left.pid) > depthOf(right.pid);
             });
 
-  int killed = 0, failed = 0;
-  for (auto &p : finalList) {
-    if (killProcess(p)) {
-      printf("  " GREEN("Killed") "  %-32s PID %lu\n", p.name.c_str(),
-             (unsigned long)p.pid);
-      killed++;
-    } else {
-      printf("  " RED("Failed") "  %-32s PID %lu\n", p.name.c_str(),
-             (unsigned long)p.pid);
-      failed++;
-    }
-  }
-  printf(BOLD("  Done:") " %d killed, %d failed.\n", killed, failed);
-  return failed == 0 ? 0 : 2;
+  const std::vector<ProcessIdentity> plan(finalList.begin(), finalList.end());
+  if (!isElevated() && needsElevation(finalList) && confirmElevation())
+    return launchTargetWorker(plan, L"runas");
+  return executeTargets(plan);
 }
 
 // ─── Filter processes for pattern mode ───────────────────────────────────────
@@ -1240,6 +1284,7 @@ static std::vector<ProcInfo> filterProcs(const std::vector<ProcInfo> &all,
     portHi = static_cast<int>(hi);
   }
   DWORD parentPid = 0;
+  ULONGLONG parentCreated = 0;
   if (!a.parentSpec.empty()) {
     parentPid = resolveParentPid(a.parentSpec, all);
     if (parentPid == 0) {
@@ -1249,6 +1294,9 @@ static std::vector<ProcInfo> filterProcs(const std::vector<ProcInfo> &all,
               a.parentSpec.c_str());
       return {};
     }
+    for (const auto &parent : all)
+      if (parent.pid == parentPid)
+        parentCreated = parent.creationTime;
   }
 
   Pattern namePat(a.pattern);
@@ -1274,8 +1322,12 @@ static std::vector<ProcInfo> filterProcs(const std::vector<ProcInfo> &all,
       if (!namePat.match(p.name) && !namePat.match(stripExeSuffix(p.name)))
         continue;
     }
+    if (parentPid && (p.ppid != parentPid || !parentCreated ||
+                      p.creationTime < parentCreated))
+      continue;
     if (!a.cmdlinePat.empty()) {
-      if (!cmdlinePat.match(getCmdline(p.pid)))
+      const auto *command = getCmdline(p.pid);
+      if (!command || !cmdlinePat.match(*command))
         continue;
     }
     if (!a.modulePat.empty())
@@ -1286,9 +1338,6 @@ static std::vector<ProcInfo> filterProcs(const std::vector<ProcInfo> &all,
         continue;
     if (!a.windowPat.empty())
       if (!processHasWindow(p.pid, windowPat))
-        continue;
-    if (parentPid != 0)
-      if (p.ppid != parentPid)
         continue;
     results.push_back(p);
   }
@@ -1346,7 +1395,6 @@ static int cmdRamHog(const Args &a, const std::vector<ProcInfo> &all) {
   for (auto p : all) {
     if (p.pid == 0 || p.pid == 4)
       continue;
-    enrichBasic(p);
     if (p.workingSetBytes > limitBytes)
       hogs.push_back(p);
   }
@@ -1372,13 +1420,17 @@ static int cmdCpuHog(const Args &a, const std::vector<ProcInfo> &all) {
   }
   printf(BOLD("  Finding processes using > %.1f%% CPU...\n"), limit);
   auto cpuMap = measureCpuUsage(a.sampleSecs, all);
+  if (!cpuMap) {
+    fprintf(stderr, "  Cannot obtain a complete CPU sample\n");
+    return 2;
+  }
 
   std::vector<ProcInfo> hogs;
   for (auto p : all) {
     if (p.pid == 0 || p.pid == 4)
       continue;
-    auto it = cpuMap.find(p.pid);
-    if (it == cpuMap.end())
+    auto it = cpuMap->find(p.pid);
+    if (it == cpuMap->end())
       continue;
     p.cpuPercent = it->second;
     if (p.cpuPercent >= limit)
@@ -1442,7 +1494,6 @@ static int cmdRestart(const Args &a, const std::vector<ProcInfo> &all) {
   std::vector<ProcInfo> targets;
   for (auto p : all) {
     if (stripExeSuffix(p.name).find(nameArg) != std::string::npos) {
-      enrichBasic(p);
       targets.push_back(p);
     }
   }
@@ -1458,28 +1509,29 @@ static int cmdRestart(const Args &a, const std::vector<ProcInfo> &all) {
         targets.size());
     return 1;
   }
-  const std::string exePath = targets.front().exePath;
-  if (exePath.empty()) {
-    fprintf(stderr, RED("  Error:") " cannot determine executable path\n");
+  const auto &target = targets.front();
+  auto handle = makeHandle(
+      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.pid));
+  if (target.pid == GetCurrentProcessId() || !handle || !target.creationTime ||
+      creationTimeOf(handle.get()) != target.creationTime) {
+    fprintf(stderr, "  Cannot verify restart target identity\n");
+    return 2;
+  }
+  const auto widePath = processPath(handle.get());
+  const auto exePath = toNarrow(widePath);
+  if (widePath.empty()) {
+    fprintf(stderr,
+            RED("  Error:") " cannot determine executable path for restart\n");
     return 1;
   }
   printf(BOLD("  Will restart: ") "%s\n", exePath.c_str());
 
   const int killResult = doKill(targets, a, all);
-  // An elevated child inherited this same restart request; the current
-  // process must not launch a second copy of the target.
-  if (g_relaunchedElevated)
-    return 0;
   // Restart only makes sense when the kill actually ran; a dry run (the
   // default without -y) must not relaunch the process.
   if (killResult != 0 || !(a.yes || a.force) || a.dryRun)
     return killResult;
 
-  const std::wstring widePath = toWide(exePath);
-  if (widePath.empty()) {
-    fprintf(stderr, RED("  Error:") " executable path is not valid UTF-8\n");
-    return 1;
-  }
   HINSTANCE result = ShellExecuteW(nullptr, L"open", widePath.c_str(), nullptr,
                                    nullptr, SW_SHOWNORMAL);
   if (reinterpret_cast<INT_PTR>(result) <= 32) {
@@ -1499,30 +1551,26 @@ int wmain(int argc, wchar_t **wargv) {
   // output code page on every exit path.
   ConsoleUtf8Guard consoleUtf8;
 
-  // Remember the original command line for a possible elevation relaunch.
-  g_argc = argc;
-  g_wargv = wargv;
-
   // Convert wchar_t argv to UTF-8 for internal processing
   std::vector<std::string> argStorage;
   std::vector<char *> argv;
   argStorage.reserve(argc);
   for (int i = 0; i < argc; i++) {
     argStorage.push_back(toNarrow(wargv[i]));
+    if (*wargv[i] && argStorage.back().empty()) {
+      fprintf(stderr, "  Invalid Unicode argument\n");
+      return 1;
+    }
     argv.push_back(argStorage.back().data());
   }
 
-  // --version / -V exits immediately before any other processing; a "--"
-  // separator means the remaining arguments are positional, not options.
-  // argv already holds the UTF-8 conversion done above.
-  for (int i = 1; i < argc; i++) {
-    const std::string arg = argv[i];
-    if (arg == "--")
-      break;
-    if (arg == "-V" || arg == "--version") {
-      printVersion();
-      return 0;
+  if (argc >= 2 && argStorage[1] == planOption) {
+    std::vector<ProcessIdentity> targets;
+    if (!decodeTargets(argc - 2, argv.data() + 2, targets) || !isElevated()) {
+      fprintf(stderr, "  Invalid elevated execution request\n");
+      return 1;
     }
+    return executeTargets(targets);
   }
 
   Args a = parseArgs(argc, argv.data());
@@ -1530,15 +1578,23 @@ int wmain(int argc, wchar_t **wargv) {
     fprintf(stderr, RED("  Error:") " %s. Use -h for help.\n", a.error.c_str());
     return 1;
   }
+  if (a.version) {
+    printVersion();
+    return 0;
+  }
   if (a.help || argc == 1) {
     printHelp();
     return 0;
   }
 
+  std::vector<ProcInfo> allProcs;
+  if (!enumProcesses(allProcs)) {
+    fprintf(stderr, "  Cannot obtain a complete process identity snapshot\n");
+    return 2;
+  }
   const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   const bool comInitialized = SUCCEEDED(comResult);
 
-  auto allProcs = enumProcesses();
   int ret = 0;
 
   if (!a.subcommand.empty()) {
@@ -1576,5 +1632,13 @@ int wmain(int argc, wchar_t **wargv) {
 
   if (comInitialized)
     CoUninitialize();
+  if (!unreadableProcesses.empty()) {
+    fprintf(stderr,
+            "  Incomplete scan: could not inspect %zu process(es). "
+            "For broader access, run from an elevated console.\n",
+            unreadableProcesses.size());
+    if (ret == 0)
+      ret = 2;
+  }
   return ret;
 }

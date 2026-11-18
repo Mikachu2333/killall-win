@@ -71,6 +71,9 @@ By default `killall` only **lists** matching processes (dry-run) and never kills
 -h, --help            Show help
 ```
 
+Use `--cmdline=--flag` or `--window=-title` when the value begins with `-`.
+The command-line, module, port, window and parent filters apply to name/PID searches. Combining them with a subcommand produces a usage error. `--top` applies to `ramhog` and `cpuhog`. `--sample` applies to `cpuhog`.
+
 ### Subcommands
 
 ```
@@ -188,16 +191,16 @@ install.bat
 
 | Feature | Windows API Used |
 |---|---|
-| Process enumeration | `CreateToolhelp32Snapshot` |
+| Process enumeration | `NtQuerySystemInformation(SystemProcessInformation)` snapshots PID, creation time, name and parent together |
 | Process termination | `TerminateProcess` |
-| Process tree | `PROCESSENTRY32.th32ParentProcessID` traversal |
+| Process tree | Parent PIDs and creation times from the same snapshot |
 | Command line | WMI `Win32_Process.CommandLine` |
 | Loaded modules | `CreateToolhelp32Snapshot (TH32CS_SNAPMODULE)` |
 | Network ports | `GetExtendedTcpTable` / `GetExtendedUdpTable` (local TCP/UDP IPv4 and IPv6) |
 | Window title | `EnumWindows` + `GetWindowText` |
 | Hung detection | `SendMessageTimeout(WM_NULL, 2000ms)` |
-| Memory usage | `GetProcessMemoryInfo` |
-| CPU usage | Two-snapshot `GetProcessTimes` delta |
+| Memory usage | Working set from the process snapshot |
+| CPU usage | User and kernel time deltas across snapshots for the same process identity |
 | GPU detection | Heuristic check for loaded D3D/DXGI/Vulkan/CUDA DLLs; this does not measure GPU memory or active utilization |
 | Process restart | `QueryFullProcessImageNameW` + `ShellExecuteW` |
 
@@ -210,8 +213,11 @@ install.bat
 - All pattern matching is case-insensitive
 - `cpuhog` reports total process CPU time divided by wall-clock time; a multithreaded process can exceed 100%
 - Port matching uses local ports only; remote service ports are intentionally ignored to prevent broad accidental matches
-- Critical Windows processes are refused even when killall is elevated
-- When a kill target cannot be opened for termination (e.g. SYSTEM processes), killall asks once whether to relaunch itself with administrator rights (UAC). The prompt only appears on an interactive console, never for dry runs, and never after an elevation relaunch has already been attempted
+- Each termination checks the target's original creation time and critical status on the handle used to terminate it. An unknown identity or critical status causes a refusal. Windows 7 uses the `ProcessBreakOnTermination` query for the critical check.
+- When a displayed target requires administrator privileges, an interactive execution can request UAC. The elevated worker receives the displayed PID/creation-time pairs in execution order. The caller waits for its result. Cancelling the UAC dialog aborts the requested operation. Dry runs and redirected input do not trigger UAC.
+- `restart` launches the replacement from the original caller after all requested terminations succeed. It requires a readable executable path before termination.
+- Command-line and module filters skip processes they cannot inspect. The summary reports an incomplete scan. An elevated console can provide access to additional processes.
+- Exit code `0` means the requested operation completed, including a complete search with zero matches. `1` indicates a usage or validation error. `2` indicates an incomplete scan, a refused or failed operation, or an unsuccessful elevation request.
 
 ---
 
